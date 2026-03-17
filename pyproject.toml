@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cy-excel-mcp"
+version = "0.1.0"
+description = "MCP server for parsing WeChat order messages and writing orders into OneDrive Excel."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp",
+  "msal",
+  "pydantic>=2",
+  "python-dotenv",
+  "requests",
+]
+
+[project.scripts]
+cy-excel-mcp = "cy_excel_mcp:main"
+
+[tool.setuptools]
+py-modules = ["cy_excel_mcp"]

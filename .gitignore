@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+onedrive_token_cache.bin
+.DS_Store

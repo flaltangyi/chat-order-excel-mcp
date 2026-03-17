@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cy-excel-mcp": {
+      "baseUrl": "http://127.0.0.1:18061/mcp"
+    }
+  },
+  "imports": []
+}
