@@ -1,8 +1,10 @@
 .env
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 *.swp
 *.swo
+*.egg-info/
 onedrive_token_cache.bin
 .DS_Store
