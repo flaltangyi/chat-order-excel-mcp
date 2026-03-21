@@ -149,6 +149,8 @@ cy-excel-mcp --transport streamable-http --host 127.0.0.1 --port 18061
 
 仓库内也附带了模板文件：`config/mcporter.json.example`
 
+更完整的运行说明见：`docs/RUNNING.md`
+
 ## OpenClaw Agent 调用流程
 
 - 完整文本订单：`ingest_order_message`

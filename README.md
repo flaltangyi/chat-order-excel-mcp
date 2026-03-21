@@ -149,6 +149,8 @@ Example `mcporter.json`:
 
 An example file is also included at `config/mcporter.json.example`.
 
+Detailed runtime notes are available in `docs/RUNNING.md`.
+
 ## OpenClaw Agent Flow
 
 - Full text order: `ingest_order_message`

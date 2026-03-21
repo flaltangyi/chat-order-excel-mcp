@@ -20,7 +20,8 @@ if load_dotenv is not None:
     load_dotenv()
 
 
-AUTHORITY = "https://login.microsoftonline.com/consumers"
+TENANT_ID = os.getenv("OC_OD_TENANT_ID", "consumers")
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = ["Files.ReadWrite.All"]
 CACHE_FILE = os.getenv("OC_OD_CACHE_FILE", "onedrive_token_cache.bin")
 FILE_PATH = os.getenv("OC_OD_FILE_PATH", "订单汇总.xlsx")
@@ -62,6 +63,13 @@ def _read_text_file(path: str) -> str:
 def _write_text_file(path: str, content: str) -> None:
     with open(path, "w", encoding="utf-8") as file:
         file.write(content)
+
+
+def _build_msal_http_client() -> requests.Session:
+    session = requests.Session()
+    # Avoid inheriting broken system proxy settings during Microsoft login.
+    session.trust_env = False
+    return session
 
 
 def _json_result(**payload: Any) -> str:
@@ -212,6 +220,7 @@ def get_token_automatically() -> str | None:
         client_id,
         authority=AUTHORITY,
         token_cache=cache,
+        http_client=_build_msal_http_client(),
     )
 
     accounts = app.get_accounts()
@@ -818,11 +827,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    if args.transport == "streamable-http":
-        print(f"Chengyi_Order_Manager MCP listening on http://{args.host}:{args.port}/mcp")
-        mcp.run(transport="streamable-http")
-    else:
-        mcp.run(transport="stdio")
+    try:
+        if args.transport == "streamable-http":
+            print(f"Chengyi_Order_Manager MCP listening on http://{args.host}:{args.port}/mcp")
+            mcp.run(transport="streamable-http")
+        else:
+            mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        # Suppress the asyncio/anyio stack trace on manual Ctrl+C shutdown.
+        print("Chengyi_Order_Manager MCP stopped")
 
 
 if __name__ == "__main__":
