@@ -94,9 +94,10 @@ cp .env.example .env
 Edit `.env`:
 
 ```env
+OC_OD_TENANT_ID=consumers
 OC_OD_CLIENT_ID=your_microsoft_app_client_id
-OC_OD_FILE_PATH=订单汇总.xlsx
-OC_OD_TABLE_NAME=表4
+OC_OD_FILE_PATH=YourFolder/订单汇总.xlsx
+OC_OD_TABLE_NAME=表1
 OC_OD_CACHE_FILE=onedrive_token_cache.bin
 
 CY_EXCEL_MCP_HOST=127.0.0.1
@@ -182,7 +183,11 @@ An example file is also included at `config/mcporter.json.example`.
 
 ## Notes
 
+- Personal OneDrive has been validated with `OC_OD_TENANT_ID=consumers`.
+- `OC_OD_FILE_PATH` can include a nested folder path such as `YourFolder/订单汇总.xlsx`.
+- `OC_OD_TABLE_NAME` must be the Excel table object name, not the worksheet name.
 - The first Microsoft login may require device-flow authorization in the terminal.
+- After the first successful sign-in, the token is cached in `onedrive_token_cache.bin` and reused on later runs.
 - Empty values do not overwrite existing Excel values.
 - Keep `.env` and `onedrive_token_cache.bin` out of version control.
 - Temporary files such as swap files and `__pycache__` are already ignored by `.gitignore`.

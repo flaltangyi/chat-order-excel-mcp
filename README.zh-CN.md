@@ -94,9 +94,10 @@ cp .env.example .env
 编辑 `.env`：
 
 ```env
+OC_OD_TENANT_ID=consumers
 OC_OD_CLIENT_ID=你的微软应用client_id
-OC_OD_FILE_PATH=订单汇总.xlsx
-OC_OD_TABLE_NAME=表4
+OC_OD_FILE_PATH=你的文件夹/订单汇总.xlsx
+OC_OD_TABLE_NAME=表1
 OC_OD_CACHE_FILE=onedrive_token_cache.bin
 
 CY_EXCEL_MCP_HOST=127.0.0.1
@@ -182,7 +183,11 @@ cy-excel-mcp --transport streamable-http --host 127.0.0.1 --port 18061
 
 ## 注意事项
 
+- 个人 OneDrive 已验证可用，建议 `OC_OD_TENANT_ID=consumers`
+- `OC_OD_FILE_PATH` 可以填写带文件夹的相对路径，例如 `你的文件夹/订单汇总.xlsx`
+- `OC_OD_TABLE_NAME` 必须是 Excel 里的表格对象名，不是工作表名称
 - 首次连接微软账号时，终端里可能会出现 device flow 登录提示
+- 首次登录成功后，token 会缓存到 `onedrive_token_cache.bin`，后续运行会优先复用
 - 空值不会覆盖 Excel 里已有值
 - `.env` 和 `onedrive_token_cache.bin` 不应提交到仓库
 - `swap`、`__pycache__` 等临时文件已在 `.gitignore` 中忽略
