@@ -150,6 +150,7 @@ Example `mcporter.json`:
 An example file is also included at `config/mcporter.json.example`.
 
 Detailed runtime notes are available in `docs/RUNNING.md`.
+Chinese runtime notes are available in `docs/RUNNING.zh-CN.md`.
 
 ## OpenClaw Agent Flow
 
