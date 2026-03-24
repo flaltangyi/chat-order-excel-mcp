@@ -4,6 +4,8 @@
 
 [English README](README.md)
 
+字段映射文档：[docs/FIELD_MAPPING.md](docs/FIELD_MAPPING.md)
+
 ## 项目简介
 
 `cy-excel-mcp` 适合微信群录单场景：业务员有时发完整文字订单，有时先发一部分，再补地址、电话、收款信息，甚至先发图片、后发补充文字。

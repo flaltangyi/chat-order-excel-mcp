@@ -4,6 +4,8 @@ MCP server for parsing WeChat order messages, merging follow-up updates, and wri
 
 [中文说明](README.zh-CN.md)
 
+Field mapping: [docs/FIELD_MAPPING.md](docs/FIELD_MAPPING.md)
+
 ## Overview
 
 `cy-excel-mcp` is built for order-entry workflows where salespeople send order details through chat, sometimes as plain text, sometimes as follow-up updates after an image or partial draft.

@@ -29,6 +29,7 @@ TABLE_NAME = os.getenv("OC_OD_TABLE_NAME", "表4")
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 DEFAULT_HOST = os.getenv("CY_EXCEL_MCP_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("CY_EXCEL_MCP_PORT", "18061"))
+LOGS_DIR = os.path.join(os.getcwd(), "logs")
 EXCEL_HEADERS = [
     "备注",
     "发货厂家",
@@ -72,8 +73,41 @@ def _build_msal_http_client() -> requests.Session:
     return session
 
 
+def _is_network_error(exc: Exception) -> bool:
+    error_text = str(exc).lower()
+    network_markers = (
+        "name or service not known",
+        "failed to resolve",
+        "temporary failure in name resolution",
+        "max retries exceeded",
+        "connection aborted",
+        "connection refused",
+        "proxyerror",
+        "ssl",
+        "read timed out",
+        "connect timeout",
+    )
+    return any(marker in error_text for marker in network_markers)
+
+
 def _json_result(**payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _append_tool_log(tool_name: str, order_number: Any = None, result_type: Any = None, **extra: Any) -> None:
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    log_path = os.path.join(LOGS_DIR, f"tool-requests-{datetime.now().strftime('%Y-%m-%d')}.jsonl")
+    payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "tool_name": tool_name,
+        "order_number": _normalize_value(order_number),
+        "result_type": _normalize_value(result_type),
+    }
+    for key, value in extra.items():
+        payload[key] = _normalize_value(value)
+
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _normalize_value(value: Any) -> Any:
@@ -201,27 +235,43 @@ def _merge_prefer_new(old_value: Any, new_value: Any) -> Any:
     return _normalize_value(old_value)
 
 
-def get_token_automatically() -> str | None:
-    client_id = os.getenv("OC_OD_CLIENT_ID")
-    if not client_id:
-        return None
-
+def _build_token_cache() -> msal.SerializableTokenCache:
     cache = msal.SerializableTokenCache()
     if os.path.exists(CACHE_FILE):
         cache.deserialize(_read_text_file(CACHE_FILE))
+    return cache
 
+
+def _register_cache_persistence(cache: msal.SerializableTokenCache) -> None:
     def _persist_cache() -> None:
         if cache.has_state_changed:
             _write_text_file(CACHE_FILE, cache.serialize())
 
     atexit.register(_persist_cache)
 
-    app = msal.PublicClientApplication(
+
+def _build_public_client_application(
+    token_cache: msal.SerializableTokenCache | None = None,
+) -> msal.PublicClientApplication | None:
+    client_id = os.getenv("OC_OD_CLIENT_ID")
+    if not client_id:
+        return None
+
+    return msal.PublicClientApplication(
         client_id,
         authority=AUTHORITY,
-        token_cache=cache,
+        token_cache=token_cache,
         http_client=_build_msal_http_client(),
     )
+
+
+def get_token_automatically() -> str | None:
+    cache = _build_token_cache()
+    _register_cache_persistence(cache)
+
+    app = _build_public_client_application(token_cache=cache)
+    if app is None:
+        return None
 
     accounts = app.get_accounts()
     if accounts:
@@ -240,6 +290,55 @@ def get_token_automatically() -> str | None:
 
 def _build_base_url() -> str:
     return f"{GRAPH_ROOT}/me/drive/root:/{FILE_PATH}:/workbook/tables('{TABLE_NAME}')"
+
+
+def _build_workbook_base_url(file_path: str | None = None) -> str:
+    target_file_path = file_path or FILE_PATH
+    return f"{GRAPH_ROOT}/me/drive/root:/{target_file_path}:/workbook"
+
+
+def _extract_graph_error_code(detail_text: str) -> str | None:
+    try:
+        payload = json.loads(detail_text)
+    except json.JSONDecodeError:
+        return None
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, str):
+            return code
+        inner_error = error.get("innerError")
+        if isinstance(inner_error, dict):
+            inner_code = inner_error.get("code")
+            if isinstance(inner_code, str):
+                return inner_code
+    return None
+
+
+def _classify_graph_error(status_code: int, detail_text: str, operation: str) -> tuple[str, str]:
+    detail_lower = detail_text.lower()
+    error_code = (_extract_graph_error_code(detail_text) or "").lower()
+
+    if status_code in (401,):
+        return "auth_failed", "登录已失效或未完成授权，请重新登录 Microsoft 账号。"
+    if status_code == 403:
+        return "permission_denied", "当前账号没有访问该 Excel 文件或表格的权限。"
+    if status_code == 404:
+        if "itemnotfound" in detail_lower or error_code == "itemnotfound":
+            if operation == "columns":
+                return "file_not_found", "找不到目标 Excel 文件，请检查 OC_OD_FILE_PATH 是否正确。"
+            if operation == "rows":
+                return "table_not_found", "找不到目标 Excel 表格，请检查 OC_OD_TABLE_NAME 是否为表格对象名。"
+            return "resource_not_found", "找不到目标资源，请检查文件路径和表格名称。"
+        if "resourcenotfound" in detail_lower or error_code == "resourcenotfound":
+            return "resource_not_found", "找不到目标资源，请检查文件路径和表格名称。"
+    if status_code == 400:
+        if "invalidversion" in detail_lower or "invalidrequest" in detail_lower or error_code in {"invalidrequest", "badrequest"}:
+            return "table_not_found", "Excel 表格名称无效，请确认 OC_OD_TABLE_NAME 是表格对象名而不是工作表名。"
+        if "spo license" in detail_lower:
+            return "permission_denied", "当前账号或租户没有可用的 OneDrive/SharePoint 许可。"
+    return "graph_request_failed", "访问 Microsoft Graph 失败，请检查登录状态、文件路径、表格名称和权限设置。"
 
 
 class ExcelOrder(BaseModel):
@@ -346,6 +445,10 @@ class OrderIngestRequest(BaseModel):
     auto_add_new_columns: bool = Field(
         default=False,
         description="写入 Excel 时是否自动新增新列。默认关闭，避免误加表头。",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="仅解析和匹配，不真正写入 Excel。",
     )
 
 
@@ -469,6 +572,239 @@ mcp = FastMCP(
 
 
 @mcp.tool()
+def health() -> str:
+    """
+    MCP 服务快速自检。
+
+    不访问 Microsoft Graph，不触发登录，只用于 OpenClaw 启动后确认服务已加载、
+    核心配置是否存在，以及当前监听参数是否生效。
+    """
+    client_id = os.getenv("OC_OD_CLIENT_ID")
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    cache_exists = os.path.exists(CACHE_FILE)
+    result = _json_result(
+        success=True,
+        action="health",
+        message="MCP 服务可用。",
+        service_name="Chengyi_Order_Manager",
+        transport_default=os.getenv("CY_EXCEL_MCP_TRANSPORT", "streamable-http"),
+        host=DEFAULT_HOST,
+        port=DEFAULT_PORT,
+        authority=AUTHORITY,
+        tenant_id=TENANT_ID,
+        file_path=FILE_PATH,
+        table_name=TABLE_NAME,
+        client_id_configured=bool(client_id),
+        cache_file=CACHE_FILE,
+        cache_exists=cache_exists,
+        logs_dir=LOGS_DIR,
+        logs_dir_exists=os.path.isdir(LOGS_DIR),
+    )
+    _append_tool_log("health", result_type="health")
+    return result
+
+
+@mcp.tool()
+def check_login_status() -> str:
+    """
+    检查当前 Microsoft 登录状态。
+
+    只做只读检查，不会主动触发 device code 登录。
+    用于判断当前是否已命中 token cache、是否已有缓存账号、以及是否可以静默获取 token。
+    """
+    client_id = os.getenv("OC_OD_CLIENT_ID")
+    cache_exists = os.path.exists(CACHE_FILE)
+    base_info = {
+        "authority": AUTHORITY,
+        "cache_file": CACHE_FILE,
+        "cache_exists": cache_exists,
+        "tenant_id": TENANT_ID,
+        "file_path": FILE_PATH,
+        "table_name": TABLE_NAME,
+        "client_id_configured": bool(client_id),
+    }
+    if not client_id:
+        result = _json_result(
+            success=False,
+            action="login_status",
+            message="未配置 OC_OD_CLIENT_ID。",
+            **base_info,
+        )
+        _append_tool_log("check_login_status", result_type="login_status_missing_client_id")
+        return result
+
+    cache = _build_token_cache()
+    accounts: list[dict[str, Any]] = []
+    try:
+        app = _build_public_client_application(token_cache=cache)
+        if app is None:
+            result = _json_result(
+                success=False,
+                action="login_status",
+                message="无法初始化 Microsoft 登录客户端。",
+                **base_info,
+            )
+            _append_tool_log("check_login_status", result_type="login_status_init_failed")
+            return result
+
+        accounts = app.get_accounts()
+        silent_token_available = False
+        silent_check = "not_attempted"
+        detail = None
+        if accounts:
+            try:
+                result = app.acquire_token_silent(SCOPES, account=accounts[0])
+                silent_token_available = bool(result and "access_token" in result)
+                silent_check = "ok"
+            except Exception as exc:
+                detail = str(exc)
+                silent_check = "network_error" if _is_network_error(exc) else "failed"
+
+        result = _json_result(
+            success=True,
+            action="login_status",
+            message="已完成登录状态检查。",
+            account_count=len(accounts),
+            has_cached_account=bool(accounts),
+            has_silent_token=silent_token_available,
+            cached_username=_normalize_value(accounts[0].get("username")) if accounts else None,
+            silent_check=silent_check,
+            needs_login=not bool(accounts),
+            needs_network_retry=bool(accounts) and not silent_token_available and silent_check == "network_error",
+            detail=detail,
+            **base_info,
+        )
+        _append_tool_log(
+            "check_login_status",
+            order_number=None,
+            result_type="login_status",
+            has_cached_account=bool(accounts),
+            has_silent_token=silent_token_available,
+            cached_username=_normalize_value(accounts[0].get("username")) if accounts else None,
+        )
+        return result
+    except Exception as exc:
+        cache_state = {
+            "account_count": len(accounts),
+            "has_cached_account": bool(accounts),
+            "has_silent_token": False,
+            "cached_username": _normalize_value(accounts[0].get("username")) if accounts else None,
+        }
+        if _is_network_error(exc):
+            result = _json_result(
+                success=True,
+                action="login_status",
+                message="已读取本地登录缓存，但当前网络不可用，无法完成在线校验。",
+                silent_check="network_error",
+                needs_login=not bool(accounts),
+                needs_network_retry=True,
+                detail=str(exc),
+                **cache_state,
+                **base_info,
+            )
+            _append_tool_log("check_login_status", result_type="login_status_network_error")
+            return result
+        result = _json_result(
+            success=False,
+            action="login_status",
+            message="登录状态检查失败。",
+            detail=str(exc),
+            **cache_state,
+            **base_info,
+        )
+        _append_tool_log("check_login_status", result_type="login_status_failed")
+        return result
+
+
+@mcp.tool()
+def list_excel_tables(file_path: str | None = None) -> str:
+    """
+    列出目标 Excel workbook 中的所有表格对象名称。
+
+    用于辅助确认 `OC_OD_TABLE_NAME` 是否填写正确。
+    - `file_path` 留空时使用环境变量 `OC_OD_FILE_PATH`
+    - 会访问 Microsoft Graph，必要时可能触发 device flow 登录
+    """
+    target_file_path = _normalize_value(file_path) or FILE_PATH
+    try:
+        token = get_token_automatically()
+    except Exception as exc:
+        result = _json_result(
+            success=False,
+            action="list_excel_tables",
+            error_type="auth_failed",
+            message="无法初始化 Microsoft 登录状态，请检查网络或稍后重试。",
+            file_path=target_file_path,
+            detail=str(exc),
+        )
+        _append_tool_log("list_excel_tables", result_type="auth_failed", file_path=target_file_path)
+        return result
+    if not token:
+        result = _json_result(
+            success=False,
+            action="list_excel_tables",
+            error_type="auth_failed",
+            message="无法获取微软授权 Token，请确认已设置环境变量 OC_OD_CLIENT_ID 并完成设备登录。",
+            file_path=target_file_path,
+        )
+        _append_tool_log("list_excel_tables", result_type="auth_failed")
+        return result
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    proxies = {"http": None, "https": None}
+    workbook_base_url = _build_workbook_base_url(target_file_path)
+
+    try:
+        resp_tables = requests.get(f"{workbook_base_url}/tables", headers=headers, proxies=proxies, timeout=30)
+        if resp_tables.status_code != 200:
+            error_type, error_message = _classify_graph_error(
+                resp_tables.status_code,
+                resp_tables.text,
+                operation="columns",
+            )
+            result = _json_result(
+                success=False,
+                action="list_excel_tables",
+                error_type=error_type,
+                message=error_message,
+                file_path=target_file_path,
+                status_code=resp_tables.status_code,
+                detail=resp_tables.text,
+            )
+            _append_tool_log("list_excel_tables", result_type=error_type, file_path=target_file_path)
+            return result
+
+        tables = resp_tables.json().get("value", [])
+        table_names = [table.get("name") for table in tables if table.get("name")]
+        result = _json_result(
+            success=True,
+            action="list_excel_tables",
+            message="已读取 workbook 中的表格对象列表。",
+            file_path=target_file_path,
+            configured_table_name=TABLE_NAME,
+            table_count=len(table_names),
+            table_names=table_names,
+            table_name_exists=TABLE_NAME in table_names,
+        )
+        _append_tool_log("list_excel_tables", result_type="success", file_path=target_file_path)
+        return result
+    except Exception as exc:
+        result = _json_result(
+            success=False,
+            action="list_excel_tables",
+            error_type="exception",
+            message="读取 workbook 表格对象列表失败。",
+            file_path=target_file_path,
+            detail=str(exc),
+        )
+        _append_tool_log("list_excel_tables", result_type="exception", file_path=target_file_path)
+        return result
+
+
+@mcp.tool()
 def parse_wechat_order_message(
     raw_message: str,
     sender_name: str | None = None,
@@ -489,7 +825,9 @@ def parse_wechat_order_message(
         group_name=group_name,
         message_time=message_time,
     )
-    return parsed.model_dump_json(indent=2, exclude_none=True, ensure_ascii=False)
+    result = parsed.model_dump_json(indent=2, exclude_none=True, ensure_ascii=False)
+    _append_tool_log("parse_wechat_order_message", order_number=parsed.order.单号, result_type="parsed")
+    return result
 
 
 @mcp.tool()
@@ -531,7 +869,7 @@ def merge_order_update(
         for field_name in ("单号", "销售员", "客户", "货品名称", "数量", "销售金额", "收货人电话", "收货地址")
         if _normalize_value(getattr(merged_order, field_name)) is None
     ]
-    return _json_result(
+    result = _json_result(
         success=True,
         action="merged",
         duplicate_order_number=duplicate_order_number,
@@ -546,6 +884,8 @@ def merge_order_update(
         needs_review=bool(missing_fields),
         order=merged_order.to_excel_dict(),
     )
+    _append_tool_log("merge_order_update", order_number=merged_order.单号, result_type="merged")
+    return result
 
 
 @mcp.tool()
@@ -591,9 +931,9 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
     process_result = process_excel_order(
         order=final_order,
         auto_add_new_columns=request.auto_add_new_columns,
+        dry_run=request.dry_run,
     )
-
-    return _json_result(
+    result = _json_result(
         success=True,
         action=pipeline_action,
         duplicate_order_number=duplicate_order_number,
@@ -603,12 +943,21 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
         final_order=final_order.to_excel_dict(),
         process_result=json.loads(process_result),
     )
+    process_payload = json.loads(process_result)
+    _append_tool_log(
+        "ingest_order_message",
+        order_number=final_order.单号,
+        result_type=process_payload.get("action"),
+        dry_run=request.dry_run,
+    )
+    return result
 
 
 @mcp.tool()
 def process_excel_order(
     order: ExcelOrder,
     auto_add_new_columns: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """
     将标准订单对象写入 OneDrive 在线 Excel。
@@ -621,16 +970,33 @@ def process_excel_order(
     - 会优先匹配同一个 `销售员` 的最近记录
     - 空值不会覆盖旧值
     - 默认不自动建列，避免误加表头
+    - `dry_run=true` 时只做读取和匹配，不真正写入 Excel
     """
-    token = get_token_automatically()
-    if not token:
-        return _json_result(
+    order_data = order.to_excel_dict()
+    try:
+        token = get_token_automatically()
+    except Exception as exc:
+        result = _json_result(
             success=False,
             action="auth_failed",
-            message="无法获取微软授权 Token，请确认已设置环境变量 OC_OD_CLIENT_ID 并完成设备登录。",
+            error_type="auth_failed",
+            message="无法初始化 Microsoft 登录状态，请检查网络或稍后重试。",
+            dry_run=dry_run,
+            detail=str(exc),
         )
+        _append_tool_log("process_excel_order", order_number=order.单号, result_type="auth_failed")
+        return result
+    if not token:
+        result = _json_result(
+            success=False,
+            action="auth_failed",
+            error_type="auth_failed",
+            message="无法获取微软授权 Token，请确认已设置环境变量 OC_OD_CLIENT_ID 并完成设备登录。",
+            dry_run=dry_run,
+        )
+        _append_tool_log("process_excel_order", order_number=order.单号, result_type="auth_failed")
+        return result
 
-    order_data = order.to_excel_dict()
     base_url = _build_base_url()
     headers = {
         "Authorization": f"Bearer {token}",
@@ -641,13 +1007,21 @@ def process_excel_order(
     try:
         resp_cols = requests.get(f"{base_url}/columns", headers=headers, proxies=proxies, timeout=30)
         if resp_cols.status_code != 200:
-            return _json_result(
+            error_type, error_message = _classify_graph_error(
+                resp_cols.status_code,
+                resp_cols.text,
+                operation="columns",
+            )
+            result = _json_result(
                 success=False,
                 action="read_columns_failed",
-                message="无法读取 Excel 表头。",
+                error_type=error_type,
+                message=error_message,
                 status_code=resp_cols.status_code,
                 detail=resp_cols.text,
             )
+            _append_tool_log("process_excel_order", order_number=order.单号, result_type=error_type)
+            return result
         existing_columns = [col["name"] for col in resp_cols.json().get("value", [])]
 
         added_columns: list[str] = []
@@ -673,13 +1047,21 @@ def process_excel_order(
 
         resp_rows = requests.get(f"{base_url}/rows", headers=headers, proxies=proxies, timeout=30)
         if resp_rows.status_code != 200:
-            return _json_result(
+            error_type, error_message = _classify_graph_error(
+                resp_rows.status_code,
+                resp_rows.text,
+                operation="rows",
+            )
+            result = _json_result(
                 success=False,
                 action="read_rows_failed",
-                message="无法读取 Excel 行数据。",
+                error_type=error_type,
+                message=error_message,
                 status_code=resp_rows.status_code,
                 detail=resp_rows.text,
             )
+            _append_tool_log("process_excel_order", order_number=order.单号, result_type=error_type)
+            return result
         rows_data = resp_rows.json().get("value", [])
 
         target_order_id = _to_string(order_data.get("单号"))
@@ -723,6 +1105,27 @@ def process_excel_order(
         if found_row_index == -1:
             found_row_index, existing_row_values, matched_by = _find_matching_row(require_same_salesperson=False)
 
+        if dry_run:
+            preview = {header: order_data.get(header, "") for header in EXCEL_HEADERS}
+            dry_run_action = "updated" if found_row_index != -1 else "created"
+            result = _json_result(
+                success=True,
+                action="dry_run",
+                message="Dry run 已完成，仅解析和匹配，不会写入 Excel。",
+                dry_run=True,
+                would_action=dry_run_action,
+                matched_by=matched_by,
+                matched_value=target_order_id or target_customer,
+                row_index=found_row_index if found_row_index != -1 else None,
+                order=order_data,
+                excel_row_preview=preview,
+                auto_add_new_columns=auto_add_new_columns,
+                added_columns=added_columns,
+                skipped_columns=skipped_columns,
+            )
+            _append_tool_log("process_excel_order", order_number=order.单号, result_type="dry_run")
+            return result
+
         if found_row_index != -1:
             new_values: list[Any] = []
             for idx, col_name in enumerate(existing_columns):
@@ -739,7 +1142,7 @@ def process_excel_order(
                 timeout=30,
             )
             if resp_patch.status_code == 200:
-                return _json_result(
+                result = _json_result(
                     success=True,
                     action="updated",
                     message="已匹配历史订单并完成无损更新。",
@@ -750,16 +1153,26 @@ def process_excel_order(
                     skipped_columns=skipped_columns,
                     order=order_data,
                 )
-            return _json_result(
+                _append_tool_log("process_excel_order", order_number=order.单号, result_type="updated")
+                return result
+            error_type, error_message = _classify_graph_error(
+                resp_patch.status_code,
+                resp_patch.text,
+                operation="update",
+            )
+            result = _json_result(
                 success=False,
                 action="update_failed",
-                message="已找到历史记录，但更新失败。",
+                error_type=error_type,
+                message=error_message,
                 matched_by=matched_by,
                 matched_value=target_order_id or target_customer,
                 row_index=found_row_index,
                 status_code=resp_patch.status_code,
                 detail=resp_patch.text,
             )
+            _append_tool_log("process_excel_order", order_number=order.单号, result_type=error_type)
+            return result
 
         row_values = [order_data.get(col_name, "") for col_name in existing_columns]
         resp_post = requests.post(
@@ -770,7 +1183,7 @@ def process_excel_order(
             timeout=30,
         )
         if resp_post.status_code == 201:
-            return _json_result(
+            result = _json_result(
                 success=True,
                 action="created",
                 message="未匹配到历史记录，已新增订单。",
@@ -781,23 +1194,35 @@ def process_excel_order(
                 skipped_columns=skipped_columns,
                 order=order_data,
             )
-        return _json_result(
+            _append_tool_log("process_excel_order", order_number=order.单号, result_type="created")
+            return result
+        error_type, error_message = _classify_graph_error(
+            resp_post.status_code,
+            resp_post.text,
+            operation="create",
+        )
+        result = _json_result(
             success=False,
             action="create_failed",
-            message="新增订单失败。",
+            error_type=error_type,
+            message=error_message,
             status_code=resp_post.status_code,
             detail=resp_post.text,
             added_columns=added_columns,
             skipped_columns=skipped_columns,
         )
+        _append_tool_log("process_excel_order", order_number=order.单号, result_type=error_type)
+        return result
 
     except Exception as exc:
-        return _json_result(
+        result = _json_result(
             success=False,
             action="exception",
             message="脚本运行异常。",
             detail=str(exc),
         )
+        _append_tool_log("process_excel_order", order_number=order.单号, result_type="exception")
+        return result
 
 
 def parse_args() -> argparse.Namespace:
