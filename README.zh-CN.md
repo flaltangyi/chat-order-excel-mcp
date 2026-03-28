@@ -5,6 +5,7 @@
 [English README](README.md)
 
 字段映射文档：[docs/FIELD_MAPPING.md](docs/FIELD_MAPPING.md)
+OpenClaw 接入文档：[docs/OPENCLAW_INTEGRATION.zh-CN.md](docs/OPENCLAW_INTEGRATION.zh-CN.md)
 
 ## 项目简介
 
@@ -153,6 +154,7 @@ cy-excel-mcp --transport streamable-http --host 127.0.0.1 --port 18061
 
 更完整的运行说明见：`docs/RUNNING.md`
 中文运行说明见：`docs/RUNNING.zh-CN.md`
+OpenClaw 接入说明见：`docs/OPENCLAW_INTEGRATION.zh-CN.md`
 
 ## OpenClaw Agent 调用流程
 

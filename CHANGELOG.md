@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Public OpenClaw integration docs in English and Chinese
+- Documented the recommended `orderentry + wecom + stdio MCP` topology
+- Documented the security boundary between shared order-entry bots and admin-only host control
+
 ## [0.1.1] - 2026-03-21
 
 ### Added

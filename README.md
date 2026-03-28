@@ -5,6 +5,7 @@ MCP server for parsing WeChat order messages, merging follow-up updates, and wri
 [中文说明](README.zh-CN.md)
 
 Field mapping: [docs/FIELD_MAPPING.md](docs/FIELD_MAPPING.md)
+OpenClaw integration: [docs/OPENCLAW_INTEGRATION.md](docs/OPENCLAW_INTEGRATION.md)
 
 ## Overview
 
@@ -153,6 +154,7 @@ An example file is also included at `config/mcporter.json.example`.
 
 Detailed runtime notes are available in `docs/RUNNING.md`.
 Chinese runtime notes are available in `docs/RUNNING.zh-CN.md`.
+OpenClaw integration notes are available in `docs/OPENCLAW_INTEGRATION.md`.
 
 ## OpenClaw Agent Flow
 
