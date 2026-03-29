@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+staged_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+
+if [[ -z "${staged_files}" ]]; then
+  exit 0
+fi
+
+non_changelog_files="$(printf '%s\n' "${staged_files}" | grep -v '^CHANGELOG\.md$' || true)"
+
+if [[ -z "${non_changelog_files}" ]]; then
+  exit 0
+fi
+
+if ! printf '%s\n' "${staged_files}" | grep -qx 'CHANGELOG.md'; then
+  echo "pre-commit: CHANGELOG.md must be updated and staged before committing other changes." >&2
+  exit 1
+fi
+
+exit 0

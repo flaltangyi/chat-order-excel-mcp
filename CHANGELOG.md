@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-03-30
+
 ### Added / 新增
 
 - Public OpenClaw integration docs in English and Chinese
@@ -13,6 +15,8 @@ All notable changes to this project will be documented in this file.
 - 补充推荐的 `orderentry + wecom + stdio MCP` 接入拓扑
 - Documented the security boundary between shared order-entry bots and admin-only host control
 - 补充共享订单机器人与管理员宿主机控制之间的权限边界
+- Added a repository pre-commit hook to require staged `CHANGELOG.md` updates
+- 新增仓库级 pre-commit hook，要求提交其他改动时必须同步暂存 `CHANGELOG.md`
 
 ### Changed / 变更
 
