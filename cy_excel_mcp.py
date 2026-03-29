@@ -5,6 +5,7 @@ import os
 import re
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import msal
 import requests
@@ -124,6 +125,13 @@ def _to_string(value: Any) -> str:
     return "" if normalized is None else str(normalized)
 
 
+def _normalize_match_text(value: Any) -> str:
+    text = _to_string(value).strip()
+    if not text:
+        return ""
+    return re.sub(r"\s+", "", text).casefold()
+
+
 def _to_float(value: Any) -> float | None:
     normalized = _normalize_value(value)
     if normalized is None:
@@ -177,22 +185,272 @@ def _extract_order_number_and_customer_alias(text: str) -> tuple[str | None, str
     return _normalize_value(normalized_order_number), alias
 
 
-def _extract_product_line(text: str) -> tuple[str | None, str | None, str | None, str | None]:
-    for line in [item.strip() for item in text.splitlines() if item.strip()]:
-        if any(keyword in line for keyword in ("单号", "收件人", "手机", "电话", "地址")):
+def _normalize_ocr_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def _is_noise_line(line: str) -> bool:
+    cleaned = _normalize_ocr_line(line)
+    if not cleaned:
+        return True
+
+    lower_cleaned = cleaned.lower()
+    exact_noise = {
+        "客户",
+        "数量",
+        "单价",
+        "金额",
+        "合计",
+        "共计",
+        "已收",
+    }
+    if cleaned in exact_noise:
+        return True
+
+    keyword_prefixes = (
+        "单号",
+        "收件人",
+        "收货人",
+        "收货联系人",
+        "手机",
+        "手机号码",
+        "电话号码",
+        "电话",
+        "收货地址",
+        "地址",
+        "全款",
+        "总货款",
+        "合计",
+        "共计",
+        "已收",
+        "客户:",
+        "客户：",
+        "备注",
+    )
+    if cleaned.startswith(keyword_prefixes):
+        return True
+
+    if lower_cleaned.startswith("item ") or lower_cleaned.startswith("product "):
+        return False
+
+    if re.fullmatch(r"共?\s*\d+(?:\.\d+)?\s*元", cleaned):
+        return True
+
+    if "收款" in cleaned and len(cleaned) <= 20:
+        return True
+
+    return False
+
+
+def _extract_customer_name(text: str) -> str | None:
+    customer = _extract_first(r"客户[:：]\s*(.+)", text)
+    if customer:
+        return customer
+
+    lines = [_normalize_ocr_line(line) for line in text.splitlines() if line.strip()]
+    for line in lines:
+        if _is_noise_line(line):
             continue
-        match = re.search(
-            r"^(?P<name>.+?)(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[^\d\s元]+)?\s*(?P<amount>\d+(?:\.\d+)?)\s*元?$",
-            line,
+        if re.search(r"\d", line):
+            continue
+        return _normalize_value(line)
+    return None
+
+
+def _extract_contact_name(text: str) -> str | None:
+    explicit = (
+        _extract_first(r"收件人[:：]\s*(.+)", text)
+        or _extract_first(r"收货人[:：]\s*(.+)", text)
+        or _extract_first(r"收货联系人[:：]\s*(.+)", text)
+    )
+    if explicit:
+        return explicit
+
+    phone_line_match = re.search(r"1\d{10}[，,\s]+([^\n]+)", text)
+    if phone_line_match:
+        contact = _normalize_value(phone_line_match.group(1))
+        if contact and len(contact) <= 20:
+            return contact
+    return None
+
+
+def _split_quantity_and_unit(raw: str | None) -> tuple[str | None, str | None]:
+    normalized = _normalize_value(raw)
+    if normalized is None:
+        return None, None
+    match = re.match(r"(?P<qty>\d+(?:\.\d+)?)(?P<unit>.*)", str(normalized).strip())
+    if not match:
+        return _normalize_value(normalized), None
+    qty = _normalize_value(match.group("qty"))
+    unit = _normalize_value(match.group("unit"))
+    return qty, unit
+
+
+class OrderItem(BaseModel):
+    货品名称: str
+    数量: str | None = None
+    数量单位: str | None = None
+    销售单价: str | None = None
+    销售金额: str | None = None
+
+    def normalized(self) -> "OrderItem":
+        return OrderItem(
+            货品名称=_to_string(self.货品名称),
+            数量=_normalize_value(self.数量),
+            数量单位=_normalize_value(self.数量单位),
+            销售单价=_format_money(_to_float(self.销售单价)),
+            销售金额=_format_money(_to_float(self.销售金额)),
         )
-        if match:
-            return (
-                match.group("name").strip(),
-                match.group("qty").strip(),
-                _normalize_value(match.group("unit")),
-                match.group("amount").strip(),
-            )
-    return None, None, None, None
+
+    def signature(self) -> tuple[str, str, str, str, str]:
+        normalized = self.normalized()
+        return (
+            _to_string(normalized.货品名称),
+            _to_string(normalized.数量),
+            _to_string(normalized.数量单位),
+            _to_string(normalized.销售单价),
+            _to_string(normalized.销售金额),
+        )
+
+
+def _parse_item_from_structured_line(line: str) -> OrderItem | None:
+    normalized = _normalize_ocr_line(line)
+    if not normalized:
+        return None
+
+    stripped = re.sub(r"^(商品|货品|产品|item|product)\s*\d*\s*[:：]\s*", "", normalized, flags=re.IGNORECASE)
+    if stripped != normalized and ("数量" in stripped or "金额" in stripped):
+        name = _extract_first(r"^(.*?)\s*(?:[|｜]|数量[:：])", stripped)
+        quantity_raw = _extract_first(r"数量[:：]\s*([^|｜]+)", stripped)
+        unit_price = _extract_first(r"单价[:：]\s*([^|｜]+)", stripped)
+        amount = _extract_first(r"金额[:：]\s*([^|｜]+)", stripped)
+        qty, unit = _split_quantity_and_unit(quantity_raw)
+        if name:
+            return OrderItem(
+                货品名称=name.strip(),
+                数量=qty,
+                数量单位=unit,
+                销售单价=unit_price,
+                销售金额=amount,
+            ).normalized()
+    return None
+
+
+def _parse_item_from_table_line(line: str) -> OrderItem | None:
+    normalized = _normalize_ocr_line(line)
+    if _is_noise_line(normalized):
+        return None
+
+    match = re.match(
+        r"^(?P<name>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[^\d\s]+(?:\([^)]*\))?)?\s+"
+        r"(?P<unit_price>\d+(?:\.\d+)?)\s*元?\s+(?P<amount>\d+(?:\.\d+)?)\s*元?$",
+        normalized,
+    )
+    if match:
+        return OrderItem(
+            货品名称=match.group("name").strip(),
+            数量=match.group("qty").strip(),
+            数量单位=_normalize_value(match.group("unit")),
+            销售单价=match.group("unit_price").strip(),
+            销售金额=match.group("amount").strip(),
+        ).normalized()
+
+    match_amount_only = re.match(
+        r"^(?P<name>.+?)(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[^\d\s元]+(?:\([^)]*\))?)?\s*(?P<amount>\d+(?:\.\d+)?)\s*元?$",
+        normalized,
+    )
+    if match_amount_only:
+        return OrderItem(
+            货品名称=match_amount_only.group("name").strip(),
+            数量=match_amount_only.group("qty").strip(),
+            数量单位=_normalize_value(match_amount_only.group("unit")),
+            销售金额=match_amount_only.group("amount").strip(),
+        ).normalized()
+    return None
+
+
+def _extract_order_items(text: str) -> list[OrderItem]:
+    items: list[OrderItem] = []
+    seen_signatures: set[tuple[str, str, str, str, str]] = set()
+
+    for raw_line in text.splitlines():
+        normalized = _normalize_ocr_line(raw_line)
+        if not normalized:
+            continue
+
+        item = _parse_item_from_structured_line(normalized)
+        if item is None:
+            item = _parse_item_from_table_line(normalized)
+        if item is None:
+            continue
+
+        signature = item.signature()
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        items.append(item)
+
+    return items
+
+
+def _aggregate_items_for_excel(items: list[OrderItem]) -> dict[str, Any]:
+    if not items:
+        return {}
+
+    normalized_items = [item.normalized() for item in items]
+    total_amount = sum(_to_float(item.销售金额) or 0.0 for item in normalized_items)
+    has_any_amount = any(_to_float(item.销售金额) is not None for item in normalized_items)
+
+    return {
+        "货品名称": "；".join(_to_string(item.货品名称) for item in normalized_items if _to_string(item.货品名称)),
+        "数量": "；".join(_to_string(item.数量) for item in normalized_items if _to_string(item.数量)),
+        "数量单位": "；".join(_to_string(item.数量单位) for item in normalized_items if _to_string(item.数量单位)),
+        "销售单价": "；".join(_to_string(item.销售单价) for item in normalized_items if _to_string(item.销售单价)),
+        "销售金额": _format_money(total_amount) if has_any_amount else None,
+        "items": [item.model_dump(exclude_none=True) for item in normalized_items],
+    }
+
+
+def _build_excel_row_dicts(order: "ExcelOrder") -> list[dict[str, Any]]:
+    finalized_order = order.model_copy(deep=True)
+    finalized_order.finalize()
+
+    if not finalized_order.items:
+        return [finalized_order.to_excel_dict()]
+
+    total_received = _normalize_value(finalized_order.已收)
+    total_unpaid = _normalize_value(finalized_order.未收)
+    row_dicts: list[dict[str, Any]] = []
+
+    for index, item in enumerate(finalized_order.items, start=1):
+        normalized_item = item.normalized()
+        row_order = finalized_order.model_copy(deep=True)
+        row_order.items = []
+        row_order.货品名称 = _normalize_value(normalized_item.货品名称)
+        row_order.数量 = _normalize_value(normalized_item.数量)
+        row_order.数量单位 = _normalize_value(normalized_item.数量单位)
+        row_order.销售单价 = _normalize_value(normalized_item.销售单价)
+        line_amount = _normalize_value(normalized_item.销售金额)
+        row_order.销售金额 = line_amount
+        row_order.总货款 = line_amount
+        # 当前 Graph Table API 不支持稳定的表内合并单元格，这里只在首行保留整单已收/未收。
+        row_order.extra_fields["商品序号"] = str(index)
+        if _normalize_value(normalized_item.销售金额) is not None:
+            row_order.extra_fields["明细金额"] = _normalize_value(normalized_item.销售金额)
+        row_dict = row_order.to_excel_dict()
+        if index == 1:
+            row_dict["已收"] = total_received
+            row_dict["未收"] = total_unpaid
+            if total_received is not None:
+                row_dict["整单已收"] = total_received
+            if total_unpaid is not None:
+                row_dict["整单未收"] = total_unpaid
+        else:
+            row_dict["已收"] = ""
+            row_dict["未收"] = ""
+        row_dicts.append(row_dict)
+
+    return row_dicts
 
 
 def _normalize_date(date_text: str | None, message_time: str | None) -> str | None:
@@ -218,6 +476,12 @@ def _normalize_date(date_text: str | None, message_time: str | None) -> str | No
 
     match = re.search(r"(\d{2,4})[./-](\d{1,2})[./-](\d{1,2})", source)
     if not match:
+        compact_match = re.search(r"(?<!\d)(\d{2})(\d{2})(\d{2})(?:-\d+)?(?!\d)", source)
+        if compact_match:
+            year = 2000 + int(compact_match.group(1))
+            month = int(compact_match.group(2))
+            day = int(compact_match.group(3))
+            return f"{year:04d}-{month:02d}-{day:02d}"
         return None
 
     year = int(match.group(1))
@@ -290,6 +554,160 @@ def get_token_automatically() -> str | None:
 
 def _build_base_url() -> str:
     return f"{GRAPH_ROOT}/me/drive/root:/{FILE_PATH}:/workbook/tables('{TABLE_NAME}')"
+
+
+def _column_index_to_letter(index: int) -> str:
+    result = ""
+    current = index + 1
+    while current > 0:
+        current, remainder = divmod(current - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _parse_table_range_address(address: str) -> tuple[str, int, int] | None:
+    normalized = address.strip()
+    match = re.match(r"^(?P<sheet>.+)!(?P<start_col>\$?[A-Z]+)\$?(?P<start_row>\d+):", normalized)
+    if not match:
+        return None
+    sheet_name = match.group("sheet").strip().strip("'")
+    start_col_letters = match.group("start_col").replace("$", "")
+    start_row = int(match.group("start_row"))
+
+    start_col_index = 0
+    for char in start_col_letters:
+        start_col_index = start_col_index * 26 + (ord(char) - 64)
+    start_col_index -= 1
+    return sheet_name, start_col_index, start_row
+
+
+def _get_table_layout(
+    base_url: str,
+    headers: dict[str, str],
+    proxies: dict[str, str | None],
+) -> tuple[str, int, int, str | None] | None:
+    resp_range = requests.get(f"{base_url}/range", headers=headers, proxies=proxies, timeout=30)
+    if resp_range.status_code != 200:
+        return None
+    address = resp_range.json().get("address")
+    if not address:
+        return None
+    parsed = _parse_table_range_address(address)
+    if parsed is None:
+        return None
+
+    worksheet_id = None
+    resp_worksheet = requests.get(f"{base_url}/worksheet", headers=headers, proxies=proxies, timeout=30)
+    if resp_worksheet.status_code == 200:
+        worksheet_id = resp_worksheet.json().get("id")
+
+    sheet_name, start_col_index, start_row = parsed
+    return sheet_name, start_col_index, start_row, worksheet_id
+
+
+def _format_payment_block(
+    base_url: str,
+    headers: dict[str, str],
+    proxies: dict[str, str | None],
+    existing_columns: list[str],
+    row_indexes: list[int],
+) -> tuple[bool, str | None]:
+    layout = _get_table_layout(base_url, headers, proxies)
+    if layout is None:
+        return False, "无法定位 Excel 表格所在工作表，跳过已收/未收样式设置。"
+
+    sheet_name, start_col_index, header_row, worksheet_id = layout
+    data_start_row = header_row + 1
+    first_row = data_start_row + min(row_indexes)
+    last_row = data_start_row + max(row_indexes)
+
+    def _build_range_bases(column_letter: str) -> list[str]:
+        simple_range = f"{column_letter}{first_row}:{column_letter}{last_row}"
+        bases: list[str] = []
+        if worksheet_id:
+            bases.append(
+                f"{GRAPH_ROOT}/me/drive/root:/{FILE_PATH}:/workbook/worksheets/"
+                f"{quote(worksheet_id, safe='')}/range(address='{simple_range}')"
+            )
+        bases.append(
+            f"{GRAPH_ROOT}/me/drive/root:/{FILE_PATH}:/workbook/worksheets/"
+            f"{quote(sheet_name, safe='')}/range(address='{simple_range}')"
+        )
+        return bases
+
+    for column_name in ("已收", "未收"):
+        if column_name not in existing_columns:
+            continue
+        column_index = start_col_index + existing_columns.index(column_name)
+        column_letter = _column_index_to_letter(column_index)
+        last_error = None
+        styled = False
+        for range_base in _build_range_bases(column_letter):
+            font_resp = requests.patch(
+                f"{range_base}/format/font",
+                headers=headers,
+                json={"color": "#FF0000", "bold": True},
+                proxies=proxies,
+                timeout=30,
+            )
+            if font_resp.status_code != 200:
+                last_error = f"{column_name} 列字体着色失败（status={font_resp.status_code}）。"
+                continue
+
+            alignment_resp = requests.patch(
+                f"{range_base}/format",
+                headers=headers,
+                json={
+                    "horizontalAlignment": "Center",
+                    "verticalAlignment": "Center",
+                    "wrapText": True,
+                },
+                proxies=proxies,
+                timeout=30,
+            )
+            if alignment_resp.status_code != 200:
+                last_error = f"{column_name} 列对齐设置失败（status={alignment_resp.status_code}）。"
+                continue
+
+            fill_resp = requests.patch(
+                f"{range_base}/format/fill",
+                headers=headers,
+                json={"color": "#FFF2CC"},
+                proxies=proxies,
+                timeout=30,
+            )
+            if fill_resp.status_code != 200:
+                last_error = f"{column_name} 列背景着色失败（status={fill_resp.status_code}）。"
+                continue
+
+            border_payload = {
+                "style": "Continuous",
+                "color": "#C00000",
+                "weight": "Thin",
+            }
+            border_ok = True
+            for side in ("EdgeTop", "EdgeBottom", "EdgeLeft", "EdgeRight"):
+                border_resp = requests.patch(
+                    f"{range_base}/format/borders/{side}",
+                    headers=headers,
+                    json=border_payload,
+                    proxies=proxies,
+                    timeout=30,
+                )
+                if border_resp.status_code != 200:
+                    last_error = f"{column_name} 列边框设置失败（status={border_resp.status_code}）。"
+                    border_ok = False
+                    break
+            if not border_ok:
+                continue
+
+            styled = True
+            break
+
+        if not styled:
+            return False, last_error or f"{column_name} 列样式设置失败。"
+
+    return True, None
 
 
 def _build_workbook_base_url(file_path: str | None = None) -> str:
@@ -365,6 +783,7 @@ class ExcelOrder(BaseModel):
     收货联系人: str | None = None
     收货人电话: str | None = None
     收货地址: str | None = None
+    items: list[OrderItem] = Field(default_factory=list)
     extra_fields: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -374,6 +793,23 @@ class ExcelOrder(BaseModel):
         return self
 
     def finalize(self) -> "ExcelOrder":
+        if self.items:
+            aggregated = _aggregate_items_for_excel(self.items)
+            if _normalize_value(self.货品名称) is None:
+                self.货品名称 = _normalize_value(aggregated.get("货品名称"))
+            if _normalize_value(self.数量) is None:
+                self.数量 = _normalize_value(aggregated.get("数量"))
+            if _normalize_value(self.数量单位) is None:
+                self.数量单位 = _normalize_value(aggregated.get("数量单位"))
+            if _normalize_value(self.销售单价) is None:
+                self.销售单价 = _normalize_value(aggregated.get("销售单价"))
+            if _normalize_value(self.销售金额) is None:
+                self.销售金额 = _normalize_value(aggregated.get("销售金额"))
+            self.extra_fields["商品明细"] = json.dumps(
+                aggregated.get("items", []),
+                ensure_ascii=False,
+            )
+
         total_payment = _to_float(self.总货款)
         received_payment = _to_float(self.已收)
         sales_amount = _to_float(self.销售金额)
@@ -382,8 +818,6 @@ class ExcelOrder(BaseModel):
 
         if total_payment is None and sales_amount is not None:
             total_payment = sales_amount
-        if received_payment is None and sales_amount is not None:
-            received_payment = sales_amount
         unpaid = None
         if total_payment is not None and received_payment is not None:
             unpaid = total_payment - received_payment
@@ -392,12 +826,8 @@ class ExcelOrder(BaseModel):
             sales_amount = total_payment
 
         profit = _to_float(self.利润)
-        if profit is None and sales_amount is not None:
-            cost_value = cost_amount or 0.0
-            shipping_value = shipping_fee or 0.0
-            profit = sales_amount - cost_value - shipping_value
 
-        self.日期 = _normalize_date(self.日期, None)
+        self.日期 = _normalize_date(self.日期, None) or datetime.now().strftime("%Y-%m-%d")
         self.销售金额 = _format_money(sales_amount)
         self.总货款 = _format_money(total_payment)
         self.已收 = _format_money(received_payment)
@@ -461,29 +891,23 @@ def _parse_wechat_order_message_model(
     lines = [line.strip() for line in raw_message.splitlines() if line.strip()]
 
     order_number, customer_alias = _extract_order_number_and_customer_alias(raw_message)
-    contact_name = _extract_first(r"收件人[:：]\s*(.+)", raw_message)
+    contact_name = _extract_contact_name(raw_message)
     phone = _extract_phone(raw_message)
     address = _extract_first(r"收货地址[:：]\s*(.+)", raw_message)
     order_date = _normalize_date(order_number, message_time)
-    sales_amount = _extract_first(r"(?:全款|总货款)[:：]?\s*([0-9]+(?:\.[0-9]+)?)\s*元?", raw_message)
+    total_amount = _extract_first(r"(?:全款|总货款|合计|共计|共)[:：]?[ \t]*([0-9]+(?:\.[0-9]+)?)\s*元?", raw_message)
+    received_amount = _extract_first(r"(?:已收|实收|收到)[:：]?[ \t]*([0-9]+(?:\.[0-9]+)?)\s*元?", raw_message)
     payment_note = _extract_first(r"(.+收款)", raw_message)
+    item_count = _extract_first(r"(?:商品|货品|产品)总数[:：]\s*(\d+)", raw_message)
 
-    product_name, quantity, quantity_unit, product_line_amount = _extract_product_line(raw_message)
-    if sales_amount is None:
-        sales_amount = product_line_amount
+    items = _extract_order_items(raw_message)
+    aggregated_items = _aggregate_items_for_excel(items)
+    if total_amount is None:
+        total_amount = _normalize_value(aggregated_items.get("销售金额"))
+    if received_amount is None and re.search(r"全款\s*\d+(?:\.\d+)?\s*元?", raw_message):
+        received_amount = total_amount
 
-    customer = None
-    for line in lines:
-        if line.startswith(("单号", "收件人", "手机号码", "手机号", "电话", "收货地址", "全款", "总货款")):
-            continue
-        if payment_note and line == payment_note:
-            continue
-        if line == product_name:
-            continue
-        if re.search(r"\d", line) and product_name and line.find(product_name) != -1:
-            continue
-        customer = line
-        break
+    customer = _extract_customer_name(raw_message)
 
     if customer is None:
         customer = customer_alias or contact_name
@@ -494,17 +918,30 @@ def _parse_wechat_order_message_model(
         匹配客户别名=_normalize_value(customer_alias),
         销售员=_normalize_value(sender_name),
         客户=_normalize_value(customer),
-        货品名称=_normalize_value(product_name),
-        数量=_normalize_value(quantity),
-        数量单位=_normalize_value(quantity_unit),
-        销售金额=_normalize_value(sales_amount),
-        总货款=_normalize_value(sales_amount),
-        已收=_normalize_value(sales_amount),
+        货品名称=_normalize_value(aggregated_items.get("货品名称")),
+        数量=_normalize_value(aggregated_items.get("数量")),
+        数量单位=_normalize_value(aggregated_items.get("数量单位")),
+        销售单价=_normalize_value(aggregated_items.get("销售单价")),
+        销售金额=_normalize_value(total_amount),
+        总货款=_normalize_value(total_amount),
+        已收=_normalize_value(received_amount),
         收货联系人=_normalize_value(contact_name or customer),
         收货人电话=_normalize_value(phone),
         收货地址=_normalize_value(address),
         备注=_normalize_value(payment_note),
+        items=items,
+        extra_fields=(
+            {
+                "商品总数": item_count,
+                "商品明细": json.dumps(aggregated_items.get("items", []), ensure_ascii=False)
+                if aggregated_items.get("items")
+                else None,
+            }
+        ),
     )
+    order.extra_fields = {
+        key: value for key, value in order.extra_fields.items() if _normalize_value(value) is not None
+    }
 
     missing_fields = [
         field_name
@@ -548,6 +985,7 @@ def _merge_orders(existing_order: ExcelOrder, new_order: ExcelOrder, sender_name
     merged.收货联系人 = _merge_prefer_new(existing_order.收货联系人, new_order.收货联系人)
     merged.收货人电话 = _merge_prefer_new(existing_order.收货人电话, new_order.收货人电话)
     merged.收货地址 = _merge_prefer_new(existing_order.收货地址, new_order.收货地址)
+    merged.items = new_order.items or existing_order.items
 
     merged_extra = dict(existing_order.extra_fields)
     for key, value in new_order.extra_fields.items():
@@ -972,7 +1410,9 @@ def process_excel_order(
     - 默认不自动建列，避免误加表头
     - `dry_run=true` 时只做读取和匹配，不真正写入 Excel
     """
-    order_data = order.to_excel_dict()
+    row_dicts = _build_excel_row_dicts(order)
+    order_data = row_dicts[0]
+    detail_row_count = len(row_dicts)
     try:
         token = get_token_automatically()
     except Exception as exc:
@@ -1067,46 +1507,74 @@ def process_excel_order(
         target_order_id = _to_string(order_data.get("单号"))
         target_customer_alias = _to_string(order.匹配客户别名)
         target_customer = _to_string(order_data.get("客户"))
+        normalized_target_order_id = _normalize_match_text(target_order_id)
+        normalized_target_customer_alias = _normalize_match_text(target_customer_alias)
+        normalized_target_customer = _normalize_match_text(target_customer)
         found_row_index = -1
         existing_row_values: list[Any] = []
         matched_by = None
+        matched_row_indexes: list[int] = []
 
         id_col_idx = existing_columns.index("单号") if "单号" in existing_columns else -1
         cust_col_idx = existing_columns.index("客户") if "客户" in existing_columns else -1
         salesperson_col_idx = existing_columns.index("销售员") if "销售员" in existing_columns else -1
 
-        def _find_matching_row(require_same_salesperson: bool) -> tuple[int, list[Any], str | None]:
+        def _matches_target_row(row_vals: list[Any], require_same_salesperson: bool) -> str | None:
+            row_id = str(row_vals[id_col_idx]).strip() if 0 <= id_col_idx < len(row_vals) else ""
+            row_cust = str(row_vals[cust_col_idx]).strip() if 0 <= cust_col_idx < len(row_vals) else ""
+            row_salesperson = str(row_vals[salesperson_col_idx]).strip() if 0 <= salesperson_col_idx < len(row_vals) else ""
+            normalized_row_id = _normalize_match_text(row_id)
+            normalized_row_cust = _normalize_match_text(row_cust)
+
+            salesperson_ok = True
+            if require_same_salesperson and target_salesperson:
+                salesperson_ok = _normalize_match_text(row_salesperson) == _normalize_match_text(target_salesperson)
+
+            if normalized_target_order_id and normalized_row_id == normalized_target_order_id:
+                return "单号"
+
+            if not salesperson_ok:
+                return None
+
+            if normalized_target_customer and normalized_row_cust == normalized_target_customer:
+                return "客户"
+
+            if normalized_target_customer_alias and normalized_row_cust == normalized_target_customer_alias:
+                return "匹配客户别名"
+
+            return None
+
+        def _collect_matching_row_indexes(start_index: int, require_same_salesperson: bool) -> list[int]:
+            matched_indexes = [start_index]
+            for i in range(start_index + 1, len(rows_data)):
+                row_vals = rows_data[i].get("values", [[]])[0]
+                if _matches_target_row(row_vals, require_same_salesperson):
+                    matched_indexes.append(i)
+                else:
+                    break
+            return matched_indexes
+
+        def _find_matching_row(require_same_salesperson: bool) -> tuple[int, list[Any], str | None, list[int]]:
             for i in range(len(rows_data) - 1, -1, -1):
                 row_vals = rows_data[i].get("values", [[]])[0]
-                row_id = str(row_vals[id_col_idx]).strip() if 0 <= id_col_idx < len(row_vals) else ""
-                row_cust = str(row_vals[cust_col_idx]).strip() if 0 <= cust_col_idx < len(row_vals) else ""
-                row_salesperson = str(row_vals[salesperson_col_idx]).strip() if 0 <= salesperson_col_idx < len(row_vals) else ""
+                matched_key = _matches_target_row(row_vals, require_same_salesperson)
+                if matched_key:
+                    matched_indexes = _collect_matching_row_indexes(i, require_same_salesperson)
+                    return i, row_vals, matched_key, matched_indexes
 
-                salesperson_ok = True
-                if require_same_salesperson and target_salesperson:
-                    salesperson_ok = row_salesperson == target_salesperson
-
-                if target_order_id and row_id == target_order_id:
-                    return i, row_vals, "单号"
-
-                if not salesperson_ok:
-                    continue
-
-                if target_customer and row_cust == target_customer:
-                    return i, row_vals, "客户"
-
-                if target_customer_alias and row_cust == target_customer_alias:
-                    return i, row_vals, "匹配客户别名"
-
-            return -1, [], None
+            return -1, [], None, []
 
         target_salesperson = _to_string(order_data.get("销售员"))
-        found_row_index, existing_row_values, matched_by = _find_matching_row(require_same_salesperson=True)
+        found_row_index, existing_row_values, matched_by, matched_row_indexes = _find_matching_row(
+            require_same_salesperson=True
+        )
         if found_row_index == -1:
-            found_row_index, existing_row_values, matched_by = _find_matching_row(require_same_salesperson=False)
+            found_row_index, existing_row_values, matched_by, matched_row_indexes = _find_matching_row(
+                require_same_salesperson=False
+            )
 
         if dry_run:
-            preview = {header: order_data.get(header, "") for header in EXCEL_HEADERS}
+            preview = [{header: row.get(header, "") for header in EXCEL_HEADERS} for row in row_dicts]
             dry_run_action = "updated" if found_row_index != -1 else "created"
             result = _json_result(
                 success=True,
@@ -1117,7 +1585,10 @@ def process_excel_order(
                 matched_by=matched_by,
                 matched_value=target_order_id or target_customer,
                 row_index=found_row_index if found_row_index != -1 else None,
+                row_indexes=matched_row_indexes or None,
+                detail_row_count=detail_row_count,
                 order=order_data,
+                orders=row_dicts,
                 excel_row_preview=preview,
                 auto_add_new_columns=auto_add_new_columns,
                 added_columns=added_columns,
@@ -1127,58 +1598,98 @@ def process_excel_order(
             return result
 
         if found_row_index != -1:
-            new_values: list[Any] = []
-            for idx, col_name in enumerate(existing_columns):
-                old_val = existing_row_values[idx] if idx < len(existing_row_values) else ""
-                new_val = order_data.get(col_name)
-                new_values.append(new_val if new_val is not None else old_val)
-
-            patch_url = f"{base_url}/rows/itemAt(index={found_row_index})"
-            resp_patch = requests.patch(
-                patch_url,
-                headers=headers,
-                json={"values": [new_values]},
-                proxies=proxies,
-                timeout=30,
-            )
-            if resp_patch.status_code == 200:
+            if len(matched_row_indexes) not in (0, detail_row_count):
                 result = _json_result(
-                    success=True,
-                    action="updated",
-                    message="已匹配历史订单并完成无损更新。",
+                    success=False,
+                    action="needs_review",
+                    error_type="row_count_mismatch",
+                    message="匹配到了历史订单，但现有明细行数与本次识别结果不一致，请人工复核后再更新。",
                     matched_by=matched_by,
                     matched_value=target_order_id or target_customer,
                     row_index=found_row_index,
-                    added_columns=added_columns,
-                    skipped_columns=skipped_columns,
-                    order=order_data,
+                    row_indexes=matched_row_indexes,
+                    detail_row_count=detail_row_count,
+                    needs_review=True,
                 )
-                _append_tool_log("process_excel_order", order_number=order.单号, result_type="updated")
+                _append_tool_log("process_excel_order", order_number=order.单号, result_type="needs_review")
                 return result
-            error_type, error_message = _classify_graph_error(
-                resp_patch.status_code,
-                resp_patch.text,
-                operation="update",
-            )
+
+            if not matched_row_indexes:
+                matched_row_indexes = [found_row_index]
+
+            for row_offset, row_index in enumerate(matched_row_indexes):
+                existing_values = rows_data[row_index].get("values", [[]])[0]
+                row_data = row_dicts[row_offset]
+                new_values: list[Any] = []
+                for idx, col_name in enumerate(existing_columns):
+                    old_val = existing_values[idx] if idx < len(existing_values) else ""
+                    new_val = row_data.get(col_name)
+                    new_values.append(new_val if new_val is not None else old_val)
+
+                patch_url = f"{base_url}/rows/itemAt(index={row_index})"
+                resp_patch = requests.patch(
+                    patch_url,
+                    headers=headers,
+                    json={"values": [new_values]},
+                    proxies=proxies,
+                    timeout=30,
+                )
+                if resp_patch.status_code != 200:
+                    error_type, error_message = _classify_graph_error(
+                        resp_patch.status_code,
+                        resp_patch.text,
+                        operation="update",
+                    )
+                    result = _json_result(
+                        success=False,
+                        action="update_failed",
+                        error_type=error_type,
+                        message=error_message,
+                        matched_by=matched_by,
+                        matched_value=target_order_id or target_customer,
+                        row_index=row_index,
+                        row_indexes=matched_row_indexes,
+                        status_code=resp_patch.status_code,
+                        detail=resp_patch.text,
+                    )
+                    _append_tool_log("process_excel_order", order_number=order.单号, result_type=error_type)
+                    return result
+
             result = _json_result(
-                success=False,
-                action="update_failed",
-                error_type=error_type,
-                message=error_message,
+                success=True,
+                action="updated",
+                message="已匹配历史订单并完成多行明细更新。",
                 matched_by=matched_by,
                 matched_value=target_order_id or target_customer,
                 row_index=found_row_index,
-                status_code=resp_patch.status_code,
-                detail=resp_patch.text,
+                row_indexes=matched_row_indexes,
+                detail_row_count=detail_row_count,
+                added_columns=added_columns,
+                skipped_columns=skipped_columns,
+                order=order_data,
+                orders=row_dicts,
             )
-            _append_tool_log("process_excel_order", order_number=order.单号, result_type=error_type)
+            format_ok, format_warning = _format_payment_block(
+                base_url=base_url,
+                headers=headers,
+                proxies=proxies,
+                existing_columns=existing_columns,
+                row_indexes=matched_row_indexes,
+            )
+            if not format_ok and format_warning:
+                result = _json_result(
+                    **json.loads(result),
+                    format_warning=format_warning,
+                )
+            _append_tool_log("process_excel_order", order_number=order.单号, result_type="updated")
             return result
 
-        row_values = [order_data.get(col_name, "") for col_name in existing_columns]
+        row_values_list = [[row_data.get(col_name, "") for col_name in existing_columns] for row_data in row_dicts]
+        created_row_indexes = list(range(len(rows_data), len(rows_data) + len(row_dicts)))
         resp_post = requests.post(
             f"{base_url}/rows",
             headers=headers,
-            json={"values": [row_values]},
+            json={"values": row_values_list},
             proxies=proxies,
             timeout=30,
         )
@@ -1186,14 +1697,28 @@ def process_excel_order(
             result = _json_result(
                 success=True,
                 action="created",
-                message="未匹配到历史记录，已新增订单。",
+                message="未匹配到历史记录，已按商品明细新增订单。",
                 matched_by=None,
                 matched_value=None,
                 row_index=None,
+                detail_row_count=detail_row_count,
                 added_columns=added_columns,
                 skipped_columns=skipped_columns,
                 order=order_data,
+                orders=row_dicts,
             )
+            format_ok, format_warning = _format_payment_block(
+                base_url=base_url,
+                headers=headers,
+                proxies=proxies,
+                existing_columns=existing_columns,
+                row_indexes=created_row_indexes,
+            )
+            if not format_ok and format_warning:
+                result = _json_result(
+                    **json.loads(result),
+                    format_warning=format_warning,
+                )
             _append_tool_log("process_excel_order", order_number=order.单号, result_type="created")
             return result
         error_type, error_message = _classify_graph_error(
