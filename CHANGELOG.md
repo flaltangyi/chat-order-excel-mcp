@@ -11,6 +11,10 @@ All notable changes to this project will be documented in this file.
 - 数量单位现在统一按“数字后面的文本”通用提取，括号中的补充说明不再写入单位列
 - Existing multi-line orders are now updated by collecting the contiguous order block around the matched row, instead of only scanning downward
 - 更新已有多行订单时，现在会围绕命中行向上和向下收集连续订单块，而不再只向下扫描
+- Standalone address lines can now be recognized without requiring a `收货地址:` prefix
+- 现在无需 `收货地址:` 前缀，也可以识别独立地址行
+- Supplement-only follow-up messages can now update shared fields across an existing multi-line order block without requiring item-line counts to match
+- 仅补充单号/收款/联系人/地址的后续消息，现在可以直接更新已有多行订单块的共享字段，不再要求商品行数一致
 
 ## [0.1.2] - 2026-03-30
 

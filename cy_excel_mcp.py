@@ -274,6 +274,36 @@ def _extract_contact_name(text: str) -> str | None:
     return None
 
 
+def _looks_like_address(line: str) -> bool:
+    normalized = _normalize_ocr_line(line)
+    if not normalized:
+        return False
+    if re.search(r"1\d{10}", normalized):
+        return False
+    if "收款" in normalized:
+        return False
+    if _parse_item_from_structured_line(normalized) is not None:
+        return False
+    if _parse_item_from_table_line(normalized) is not None:
+        return False
+    address_keywords = ("省", "市", "区", "县", "镇", "乡", "村", "街道", "大道", "路", "街", "号", "栋", "幢", "楼", "单元", "室")
+    keyword_hits = sum(1 for keyword in address_keywords if keyword in normalized)
+    return keyword_hits >= 2
+
+
+def _extract_address(text: str) -> str | None:
+    explicit = _extract_first(r"(?:收货地址|地址)[:：]\s*(.+)", text)
+    if explicit:
+        return explicit
+
+    candidate_lines = [_normalize_ocr_line(line) for line in text.splitlines() if line.strip()]
+    address_candidates = [line for line in candidate_lines if _looks_like_address(line)]
+    if not address_candidates:
+        return None
+    address_candidates.sort(key=len, reverse=True)
+    return _normalize_value(address_candidates[0])
+
+
 def _split_quantity_and_unit(raw: str | None) -> tuple[str | None, str | None]:
     normalized = _normalize_value(raw)
     if normalized is None:
@@ -463,6 +493,15 @@ def _build_excel_row_dicts(order: "ExcelOrder") -> list[dict[str, Any]]:
         row_dicts.append(row_dict)
 
     return row_dicts
+
+
+def _has_item_details(order: "ExcelOrder") -> bool:
+    if order.items:
+        return True
+    return any(
+        _normalize_value(getattr(order, field_name)) is not None
+        for field_name in ("货品名称", "数量", "数量单位", "销售单价")
+    )
 
 
 def _normalize_date(date_text: str | None, message_time: str | None) -> str | None:
@@ -905,7 +944,7 @@ def _parse_wechat_order_message_model(
     order_number, customer_alias = _extract_order_number_and_customer_alias(raw_message)
     contact_name = _extract_contact_name(raw_message)
     phone = _extract_phone(raw_message)
-    address = _extract_first(r"收货地址[:：]\s*(.+)", raw_message)
+    address = _extract_address(raw_message)
     order_date = _normalize_date(order_number, message_time)
     total_amount = _extract_first(r"(?:全款|总货款|合计|共计|共)[:：]?[ \t]*([0-9]+(?:\.[0-9]+)?)\s*元?", raw_message)
     received_amount = _extract_first(r"(?:已收|实收|收到)[:：]?[ \t]*([0-9]+(?:\.[0-9]+)?)\s*元?", raw_message)
@@ -1372,17 +1411,22 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
         pipeline_action = "parsed_then_processed"
         duplicate_order_number = False
 
-    missing_fields = [
-        field_name
-        for field_name in ("单号", "销售员", "客户", "货品名称", "数量", "销售金额", "收货人电话", "收货地址")
-        if _normalize_value(getattr(final_order, field_name)) is None
-    ]
-    needs_review = bool(missing_fields)
     process_result = process_excel_order(
         order=final_order,
         auto_add_new_columns=request.auto_add_new_columns,
         dry_run=request.dry_run,
     )
+    process_payload = json.loads(process_result)
+    required_fields = ("单号", "销售员", "客户", "货品名称", "数量", "销售金额", "收货人电话", "收货地址")
+    missing_fields = [
+        field_name
+        for field_name in required_fields
+        if _normalize_value(getattr(final_order, field_name)) is None
+    ]
+    needs_review = bool(missing_fields)
+    if process_payload.get("success") and process_payload.get("action") == "updated" and not _has_item_details(final_order):
+        missing_fields = [field_name for field_name in missing_fields if field_name not in {"货品名称", "数量", "销售金额"}]
+        needs_review = bool(missing_fields)
     result = _json_result(
         success=True,
         action=pipeline_action,
@@ -1391,9 +1435,8 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
         missing_fields=missing_fields,
         parsed_order=parsed.order.to_excel_dict(),
         final_order=final_order.to_excel_dict(),
-        process_result=json.loads(process_result),
+        process_result=process_payload,
     )
-    process_payload = json.loads(process_result)
     _append_tool_log(
         "ingest_order_message",
         order_number=final_order.单号,
@@ -1425,6 +1468,7 @@ def process_excel_order(
     row_dicts = _build_excel_row_dicts(order)
     order_data = row_dicts[0]
     detail_row_count = len(row_dicts)
+    has_item_details = _has_item_details(order)
     try:
         token = get_token_automatically()
     except Exception as exc:
@@ -1619,6 +1663,112 @@ def process_excel_order(
             return result
 
         if found_row_index != -1:
+            if not matched_row_indexes:
+                matched_row_indexes = [found_row_index]
+
+            if not has_item_details:
+                shared_fields = {
+                    "备注",
+                    "发货厂家",
+                    "产品供应商",
+                    "日期",
+                    "单号",
+                    "销售员",
+                    "客户",
+                    "运费",
+                    "利润",
+                    "收货联系人",
+                    "收货人电话",
+                    "收货地址",
+                }
+                first_row_index = matched_row_indexes[0]
+                total_received = _normalize_value(order.已收)
+                total_unpaid = _normalize_value(order.未收)
+
+                for row_index in matched_row_indexes:
+                    existing_values = rows_data[row_index].get("values", [[]])[0]
+                    new_values: list[Any] = []
+                    for idx, col_name in enumerate(existing_columns):
+                        old_val = existing_values[idx] if idx < len(existing_values) else ""
+                        if col_name in shared_fields:
+                            new_val = order_data.get(col_name)
+                            new_values.append(new_val if new_val is not None else old_val)
+                            continue
+
+                        if col_name == "已收":
+                            if row_index == first_row_index:
+                                new_values.append(total_received if total_received is not None else old_val)
+                            else:
+                                new_values.append("")
+                            continue
+
+                        if col_name == "未收":
+                            if row_index == first_row_index:
+                                new_values.append(total_unpaid if total_unpaid is not None else old_val)
+                            else:
+                                new_values.append("")
+                            continue
+
+                        new_values.append(old_val)
+
+                    patch_url = f"{base_url}/rows/itemAt(index={row_index})"
+                    resp_patch = requests.patch(
+                        patch_url,
+                        headers=headers,
+                        json={"values": [new_values]},
+                        proxies=proxies,
+                        timeout=30,
+                    )
+                    if resp_patch.status_code != 200:
+                        error_type, error_message = _classify_graph_error(
+                            resp_patch.status_code,
+                            resp_patch.text,
+                            operation="update",
+                        )
+                        result = _json_result(
+                            success=False,
+                            action="update_failed",
+                            error_type=error_type,
+                            message=error_message,
+                            matched_by=matched_by,
+                            matched_value=target_order_id or target_customer,
+                            row_index=row_index,
+                            row_indexes=matched_row_indexes,
+                            status_code=resp_patch.status_code,
+                            detail=resp_patch.text,
+                        )
+                        _append_tool_log("process_excel_order", order_number=order.单号, result_type=error_type)
+                        return result
+
+                result = _json_result(
+                    success=True,
+                    action="updated",
+                    message="已匹配历史订单并完成补充信息更新。",
+                    matched_by=matched_by,
+                    matched_value=target_order_id or target_customer,
+                    row_index=found_row_index,
+                    row_indexes=matched_row_indexes,
+                    detail_row_count=len(matched_row_indexes),
+                    added_columns=added_columns,
+                    skipped_columns=skipped_columns,
+                    order=order_data,
+                    orders=row_dicts,
+                )
+                format_ok, format_warning = _format_payment_block(
+                    base_url=base_url,
+                    headers=headers,
+                    proxies=proxies,
+                    existing_columns=existing_columns,
+                    row_indexes=matched_row_indexes,
+                )
+                if not format_ok and format_warning:
+                    result = _json_result(
+                        **json.loads(result),
+                        format_warning=format_warning,
+                    )
+                _append_tool_log("process_excel_order", order_number=order.单号, result_type="updated")
+                return result
+
             if len(matched_row_indexes) not in (0, detail_row_count):
                 result = _json_result(
                     success=False,
@@ -1634,9 +1784,6 @@ def process_excel_order(
                 )
                 _append_tool_log("process_excel_order", order_number=order.单号, result_type="needs_review")
                 return result
-
-            if not matched_row_indexes:
-                matched_row_indexes = [found_row_index]
 
             for row_offset, row_index in enumerate(matched_row_indexes):
                 existing_values = rows_data[row_index].get("values", [[]])[0]
