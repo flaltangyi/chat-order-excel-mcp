@@ -282,8 +282,20 @@ def _split_quantity_and_unit(raw: str | None) -> tuple[str | None, str | None]:
     if not match:
         return _normalize_value(normalized), None
     qty = _normalize_value(match.group("qty"))
-    unit = _normalize_value(match.group("unit"))
+    unit = _normalize_quantity_unit(match.group("unit"))
     return qty, unit
+
+
+def _normalize_quantity_unit(raw: str | None) -> str | None:
+    normalized = _normalize_value(raw)
+    if normalized is None:
+        return None
+    unit_text = str(normalized).strip()
+    if "(" in unit_text:
+        unit_text = unit_text.split("(", 1)[0].strip()
+    if "（" in unit_text:
+        unit_text = unit_text.split("（", 1)[0].strip()
+    return _normalize_value(unit_text)
 
 
 class OrderItem(BaseModel):
@@ -297,7 +309,7 @@ class OrderItem(BaseModel):
         return OrderItem(
             货品名称=_to_string(self.货品名称),
             数量=_normalize_value(self.数量),
-            数量单位=_normalize_value(self.数量单位),
+            数量单位=_normalize_quantity_unit(self.数量单位),
             销售单价=_format_money(_to_float(self.销售单价)),
             销售金额=_format_money(_to_float(self.销售金额)),
         )
@@ -350,7 +362,7 @@ def _parse_item_from_table_line(line: str) -> OrderItem | None:
         return OrderItem(
             货品名称=match.group("name").strip(),
             数量=match.group("qty").strip(),
-            数量单位=_normalize_value(match.group("unit")),
+            数量单位=_normalize_quantity_unit(match.group("unit")),
             销售单价=match.group("unit_price").strip(),
             销售金额=match.group("amount").strip(),
         ).normalized()
@@ -363,7 +375,7 @@ def _parse_item_from_table_line(line: str) -> OrderItem | None:
         return OrderItem(
             货品名称=match_amount_only.group("name").strip(),
             数量=match_amount_only.group("qty").strip(),
-            数量单位=_normalize_value(match_amount_only.group("unit")),
+            数量单位=_normalize_quantity_unit(match_amount_only.group("unit")),
             销售金额=match_amount_only.group("amount").strip(),
         ).normalized()
     return None
@@ -1546,12 +1558,21 @@ def process_excel_order(
 
         def _collect_matching_row_indexes(start_index: int, require_same_salesperson: bool) -> list[int]:
             matched_indexes = [start_index]
+
+            for i in range(start_index - 1, -1, -1):
+                row_vals = rows_data[i].get("values", [[]])[0]
+                if _matches_target_row(row_vals, require_same_salesperson):
+                    matched_indexes.insert(0, i)
+                else:
+                    break
+
             for i in range(start_index + 1, len(rows_data)):
                 row_vals = rows_data[i].get("values", [[]])[0]
                 if _matches_target_row(row_vals, require_same_salesperson):
                     matched_indexes.append(i)
                 else:
                     break
+
             return matched_indexes
 
         def _find_matching_row(require_same_salesperson: bool) -> tuple[int, list[Any], str | None, list[int]]:
