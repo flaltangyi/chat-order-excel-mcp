@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed / 变更
+
+- Quantity units are now parsed generically from the text immediately following the quantity number, while parenthetical notes are ignored for the unit field
+- 数量单位现在统一按“数字后面的文本”通用提取，括号中的补充说明不再写入单位列
+
 ## [0.1.2] - 2026-03-30
 
 ### Added / 新增

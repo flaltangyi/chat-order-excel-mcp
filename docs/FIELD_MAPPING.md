@@ -52,6 +52,27 @@ These fields may appear in MCP tool payloads but are not written to the 22 Excel
 | `匹配客户别名` | Customer alias extracted from order number suffix such as `260313-05（B&D）` |
 | `extra_fields` | Extra Excel columns not included in the fixed 22 headers |
 
+## Quantity Unit Rule / 数量单位规则
+
+- The quantity is the numeric part, and the quantity unit is the text immediately following that number.
+- Parenthetical notes after the unit are treated as supplemental text and are not written into `数量单位`.
+- This rule is generic and does not depend on a fixed unit list.
+
+- 数量是数字部分，数量单位是紧跟在数字后面的文本。
+- 单位后面的括号补充说明只作为备注理解，不会写入 `数量单位`。
+- 这条规则是通用规则，不依赖固定单位枚举。
+
+Examples / 示例：
+
+- `2000个` -> `数量=2000`，`数量单位=个`
+- `1件` -> `数量=1`，`数量单位=件`
+- `3包` -> `数量=3`，`数量单位=包`
+- `20张` -> `数量=20`，`数量单位=张`
+- `500支` -> `数量=500`，`数量单位=支`
+- `2卷` -> `数量=2`，`数量单位=卷`
+- `4色` -> `数量=4`，`数量单位=色`
+- `1件(1000个)` -> `数量=1`，`数量单位=件`
+
 ## Example JSON / JSON 示例
 
 ```json
