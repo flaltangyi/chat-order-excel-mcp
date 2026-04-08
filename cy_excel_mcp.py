@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -31,6 +32,8 @@ GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 DEFAULT_HOST = os.getenv("CY_EXCEL_MCP_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("CY_EXCEL_MCP_PORT", "18061"))
 LOGS_DIR = os.path.join(os.getcwd(), "logs")
+DRAFT_CACHE_FILE = os.path.join(os.getcwd(), os.getenv("CY_EXCEL_MCP_DRAFT_CACHE_FILE", "order_draft_cache.json"))
+DRAFT_CACHE_TTL_SECONDS = int(os.getenv("CY_EXCEL_MCP_DRAFT_CACHE_TTL_SECONDS", str(2 * 60 * 60)))
 EXCEL_HEADERS = [
     "备注",
     "发货厂家",
@@ -65,6 +68,19 @@ def _read_text_file(path: str) -> str:
 def _write_text_file(path: str, content: str) -> None:
     with open(path, "w", encoding="utf-8") as file:
         file.write(content)
+
+
+def _load_json_file(path: str) -> Any:
+    if not os.path.exists(path):
+        return None
+    try:
+        return json.loads(_read_text_file(path))
+    except Exception:
+        return None
+
+
+def _write_json_file(path: str, payload: Any) -> None:
+    _write_text_file(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _build_msal_http_client() -> requests.Session:
@@ -130,6 +146,104 @@ def _normalize_match_text(value: Any) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", "", text).casefold()
+
+
+def _load_recent_draft_records() -> list[dict[str, Any]]:
+    payload = _load_json_file(DRAFT_CACHE_FILE)
+    return payload if isinstance(payload, list) else []
+
+
+def _save_recent_draft_records(records: list[dict[str, Any]]) -> None:
+    os.makedirs(os.path.dirname(DRAFT_CACHE_FILE) or ".", exist_ok=True)
+    _write_json_file(DRAFT_CACHE_FILE, records[-50:])
+
+
+def _normalize_row_indexes(value: Any) -> list[int]:
+    if isinstance(value, list):
+        result: list[int] = []
+        for item in value:
+            try:
+                result.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return result
+    return []
+
+
+def _store_recent_draft(
+    order: "ExcelOrder",
+    sender_name: str | None,
+    row_indexes: list[int] | None = None,
+) -> None:
+    records = _load_recent_draft_records()
+    normalized_sender = _normalize_match_text(sender_name or order.销售员)
+    normalized_order_number = _normalize_match_text(order.单号)
+    normalized_customer = _normalize_match_text(order.客户)
+    normalized_alias = _normalize_match_text(order.匹配客户别名)
+
+    filtered_records: list[dict[str, Any]] = []
+    cutoff = time.time() - DRAFT_CACHE_TTL_SECONDS
+    for record in records:
+        try:
+            created_at = float(record.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0
+        if created_at < cutoff:
+            continue
+        same_sender = _normalize_match_text(record.get("sender_name")) == normalized_sender
+        same_order = normalized_order_number and _normalize_match_text(record.get("order_number")) == normalized_order_number
+        same_customer = normalized_customer and _normalize_match_text(record.get("customer")) == normalized_customer
+        same_alias = normalized_alias and _normalize_match_text(record.get("customer_alias")) == normalized_alias
+        if same_sender and (same_order or same_customer or same_alias):
+            continue
+        filtered_records.append(record)
+
+    filtered_records.append(
+        {
+            "created_at": time.time(),
+            "sender_name": sender_name or order.销售员,
+            "order_number": order.单号,
+            "customer": order.客户,
+            "customer_alias": order.匹配客户别名,
+            "row_indexes": row_indexes or [],
+            "order": order.model_dump(exclude_none=True),
+        }
+    )
+    _save_recent_draft_records(filtered_records)
+
+
+def _find_recent_draft(order: "ExcelOrder", sender_name: str | None) -> dict[str, Any] | None:
+    normalized_sender = _normalize_match_text(sender_name or order.销售员)
+    normalized_order_number = _normalize_match_text(order.单号)
+    normalized_customer = _normalize_match_text(order.客户)
+    normalized_alias = _normalize_match_text(order.匹配客户别名)
+
+    best_record: dict[str, Any] | None = None
+    best_score = -1
+    cutoff = time.time() - DRAFT_CACHE_TTL_SECONDS
+    for record in reversed(_load_recent_draft_records()):
+        try:
+            created_at = float(record.get("created_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if created_at < cutoff:
+            continue
+        if normalized_sender and _normalize_match_text(record.get("sender_name")) != normalized_sender:
+            continue
+
+        score = -1
+        if normalized_order_number and _normalize_match_text(record.get("order_number")) == normalized_order_number:
+            score = 3
+        elif normalized_customer and _normalize_match_text(record.get("customer")) == normalized_customer:
+            score = 2
+        elif normalized_alias and _normalize_match_text(record.get("customer_alias")) == normalized_alias:
+            score = 1
+
+        if score > best_score:
+            best_score = score
+            best_record = record
+
+    return best_record if best_score >= 0 else None
 
 
 def _to_float(value: Any) -> float | None:
@@ -272,6 +386,14 @@ def _extract_contact_name(text: str) -> str | None:
         if contact and len(contact) <= 20:
             return contact
     return None
+
+
+def _extract_salesperson_name(text: str) -> str | None:
+    explicit = (
+        _extract_first(r"销售员[:：]\s*(.+)", text)
+        or _extract_first(r"业务员[:：]\s*(.+)", text)
+    )
+    return _normalize_value(explicit)
 
 
 def _looks_like_address(line: str) -> bool:
@@ -504,6 +626,27 @@ def _has_item_details(order: "ExcelOrder") -> bool:
     )
 
 
+def _detect_message_intent(raw_message: str, has_item_details: bool) -> str:
+    normalized = re.sub(r"\s+", "", raw_message)
+    replace_keywords = (
+        "以这个为准",
+        "这个为准",
+        "以这个为主",
+        "这个为主",
+        "以上面这个为准",
+        "以下图为准",
+        "按这个为准",
+        "前面的作废",
+        "之前那个作废",
+        "修改订单",
+    )
+    if any(keyword in normalized for keyword in replace_keywords):
+        return "replace_order"
+    if has_item_details:
+        return "revise_items"
+    return "supplement"
+
+
 def _normalize_date(date_text: str | None, message_time: str | None) -> str | None:
     source = _normalize_value(date_text)
     if source is None and message_time:
@@ -557,6 +700,113 @@ def _build_token_cache() -> msal.SerializableTokenCache:
     return cache
 
 
+def _load_cache_payload() -> dict[str, Any] | None:
+    if not os.path.exists(CACHE_FILE):
+        return None
+    try:
+        return json.loads(_read_text_file(CACHE_FILE))
+    except Exception:
+        return None
+
+
+def _save_cache_payload(payload: dict[str, Any]) -> None:
+    try:
+        _write_text_file(CACHE_FILE, json.dumps(payload))
+    except Exception:
+        pass
+
+
+def _get_valid_cached_access_token(cache_payload: dict[str, Any] | None) -> str | None:
+    if not cache_payload:
+        return None
+
+    now = int(time.time())
+    minimum_expiry = now + 300
+    for token_entry in cache_payload.get("AccessToken", {}).values():
+        target = str(token_entry.get("target") or "")
+        scopes = set(target.split())
+        if not set(SCOPES).issubset(scopes):
+            continue
+        try:
+            expires_on = int(token_entry.get("expires_on") or 0)
+        except (TypeError, ValueError):
+            expires_on = 0
+        if expires_on >= minimum_expiry and token_entry.get("secret"):
+            return str(token_entry["secret"])
+    return None
+
+
+def _get_cached_refresh_token(cache_payload: dict[str, Any] | None) -> str | None:
+    if not cache_payload:
+        return None
+    for token_entry in cache_payload.get("RefreshToken", {}).values():
+        secret = token_entry.get("secret")
+        if secret:
+            return str(secret)
+    return None
+
+
+def _update_cache_payload_with_token_response(
+    cache_payload: dict[str, Any] | None,
+    token_response: dict[str, Any],
+) -> None:
+    if not cache_payload:
+        return
+
+    access_tokens = cache_payload.get("AccessToken") or {}
+    refresh_tokens = cache_payload.get("RefreshToken") or {}
+    now = int(time.time())
+    expires_in = int(token_response.get("expires_in") or 3600)
+    ext_expires_in = int(token_response.get("ext_expires_in") or expires_in)
+    scope_text = token_response.get("scope") or " ".join(SCOPES + ["openid", "profile"])
+
+    for token_entry in access_tokens.values():
+        token_entry["secret"] = token_response.get("access_token")
+        token_entry["cached_at"] = str(now)
+        token_entry["expires_on"] = str(now + expires_in)
+        token_entry["extended_expires_on"] = str(now + ext_expires_in)
+        token_entry["target"] = scope_text
+        break
+
+    new_refresh_token = token_response.get("refresh_token")
+    if new_refresh_token:
+        for token_entry in refresh_tokens.values():
+            token_entry["secret"] = new_refresh_token
+            break
+
+    _save_cache_payload(cache_payload)
+
+
+def _refresh_access_token_from_cache(cache_payload: dict[str, Any] | None) -> str | None:
+    refresh_token = _get_cached_refresh_token(cache_payload)
+    client_id = os.getenv("OC_OD_CLIENT_ID")
+    if not refresh_token or not client_id:
+        return None
+
+    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    session = _build_msal_http_client()
+    response = session.post(
+        token_url,
+        data={
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": " ".join(SCOPES + ["openid", "profile", "offline_access"]),
+        },
+        timeout=30,
+    )
+    if response.status_code != 200:
+        return None
+
+    token_response = response.json()
+    access_token = token_response.get("access_token")
+    if not access_token:
+        return None
+
+    _update_cache_payload_with_token_response(cache_payload, token_response)
+    return str(access_token)
+
+
 def _register_cache_persistence(cache: msal.SerializableTokenCache) -> None:
     def _persist_cache() -> None:
         if cache.has_state_changed:
@@ -577,10 +827,23 @@ def _build_public_client_application(
         authority=AUTHORITY,
         token_cache=token_cache,
         http_client=_build_msal_http_client(),
+        instance_discovery=False,
     )
 
 
 def get_token_automatically() -> str | None:
+    cache_payload = _load_cache_payload()
+    cached_access_token = _get_valid_cached_access_token(cache_payload)
+    if cached_access_token:
+        return cached_access_token
+
+    try:
+        refreshed_access_token = _refresh_access_token_from_cache(cache_payload)
+        if refreshed_access_token:
+            return refreshed_access_token
+    except Exception:
+        pass
+
     cache = _build_token_cache()
     _register_cache_persistence(cache)
 
@@ -758,6 +1021,39 @@ def _format_payment_block(
         if not styled:
             return False, last_error or f"{column_name} 列样式设置失败。"
 
+    return True, None
+
+
+def _delete_table_rows(
+    base_url: str,
+    headers: dict[str, str],
+    proxies: dict[str, str | None],
+    row_indexes: list[int],
+) -> tuple[bool, str | None]:
+    for row_index in sorted(row_indexes, reverse=True):
+        resp_delete = requests.post(
+            f"{base_url}/rows/itemAt(index={row_index})/delete",
+            headers=headers,
+            json={},
+            proxies=proxies,
+            timeout=30,
+        )
+        if resp_delete.status_code not in (200, 204):
+            error_type, error_message = _classify_graph_error(
+                resp_delete.status_code,
+                resp_delete.text,
+                operation="update",
+            )
+            return False, _json_result(
+                success=False,
+                action="delete_failed",
+                error_type=error_type,
+                message=error_message,
+                row_index=row_index,
+                row_indexes=row_indexes,
+                status_code=resp_delete.status_code,
+                detail=resp_delete.text,
+            )
     return True, None
 
 
@@ -945,6 +1241,7 @@ def _parse_wechat_order_message_model(
     contact_name = _extract_contact_name(raw_message)
     phone = _extract_phone(raw_message)
     address = _extract_address(raw_message)
+    explicit_salesperson = _extract_salesperson_name(raw_message)
     order_date = _normalize_date(order_number, message_time)
     total_amount = _extract_first(r"(?:全款|总货款|合计|共计|共)[:：]?[ \t]*([0-9]+(?:\.[0-9]+)?)\s*元?", raw_message)
     received_amount = _extract_first(r"(?:已收|实收|收到)[:：]?[ \t]*([0-9]+(?:\.[0-9]+)?)\s*元?", raw_message)
@@ -953,6 +1250,7 @@ def _parse_wechat_order_message_model(
 
     items = _extract_order_items(raw_message)
     aggregated_items = _aggregate_items_for_excel(items)
+    message_intent = _detect_message_intent(raw_message, bool(items))
     if total_amount is None:
         total_amount = _normalize_value(aggregated_items.get("销售金额"))
     if received_amount is None and re.search(r"全款\s*\d+(?:\.\d+)?\s*元?", raw_message):
@@ -967,7 +1265,7 @@ def _parse_wechat_order_message_model(
         日期=order_date,
         单号=order_number,
         匹配客户别名=_normalize_value(customer_alias),
-        销售员=_normalize_value(sender_name),
+        销售员=_normalize_value(explicit_salesperson or sender_name),
         客户=_normalize_value(customer),
         货品名称=_normalize_value(aggregated_items.get("货品名称")),
         数量=_normalize_value(aggregated_items.get("数量")),
@@ -987,6 +1285,7 @@ def _parse_wechat_order_message_model(
                 "商品明细": json.dumps(aggregated_items.get("items", []), ensure_ascii=False)
                 if aggregated_items.get("items")
                 else None,
+                "消息意图": message_intent,
             }
         ),
     )
@@ -1045,6 +1344,79 @@ def _merge_orders(existing_order: ExcelOrder, new_order: ExcelOrder, sender_name
             merged_extra[normalized_key] = _merge_prefer_new(merged_extra.get(normalized_key), value)
     merged.extra_fields = merged_extra
     return merged
+
+
+def _build_order_from_matched_rows(
+    existing_columns: list[str],
+    rows_data: list[dict[str, Any]],
+    matched_row_indexes: list[int],
+) -> ExcelOrder:
+    if not matched_row_indexes:
+        raise ValueError("matched_row_indexes 不能为空")
+
+    base_fields: dict[str, Any] = {}
+    items: list[OrderItem] = []
+
+    for row_index in matched_row_indexes:
+        row_values = rows_data[row_index].get("values", [[]])[0]
+        row_map = {
+            column_name: (row_values[idx] if idx < len(row_values) else "")
+            for idx, column_name in enumerate(existing_columns)
+        }
+
+        for field_name in EXCEL_HEADERS:
+            if field_name in {"货品名称", "数量", "数量单位", "销售单价", "销售金额", "总货款", "已收", "未收"}:
+                continue
+            if _normalize_value(base_fields.get(field_name)) is None:
+                base_fields[field_name] = _normalize_value(row_map.get(field_name))
+
+        item_name = _normalize_value(row_map.get("货品名称"))
+        item_qty = _normalize_value(row_map.get("数量"))
+        item_unit = _normalize_value(row_map.get("数量单位"))
+        item_unit_price = _normalize_value(row_map.get("销售单价"))
+        item_amount = _normalize_value(row_map.get("销售金额"))
+        if any(value is not None for value in (item_name, item_qty, item_unit, item_unit_price, item_amount)):
+            items.append(
+                OrderItem(
+                    货品名称=_to_string(item_name) or None,
+                    数量=_to_string(item_qty) or None,
+                    数量单位=_to_string(item_unit) or None,
+                    销售单价=_to_string(item_unit_price) or None,
+                    销售金额=_to_string(item_amount) or None,
+                )
+            )
+
+    first_row_values = rows_data[matched_row_indexes[0]].get("values", [[]])[0]
+    first_row_map = {
+        column_name: (first_row_values[idx] if idx < len(first_row_values) else "")
+        for idx, column_name in enumerate(existing_columns)
+    }
+    base_fields["已收"] = _normalize_value(first_row_map.get("已收"))
+    base_fields["未收"] = _normalize_value(first_row_map.get("未收"))
+
+    numeric_compatible_fields = {
+        "数量",
+        "销售单价",
+        "销售金额",
+        "成本单价",
+        "成本金额",
+        "运费",
+        "利润",
+        "总货款",
+        "已收",
+        "未收",
+    }
+    order_kwargs: dict[str, Any] = {}
+    for field_name in EXCEL_HEADERS:
+        value = _normalize_value(base_fields.get(field_name))
+        if value is None:
+            order_kwargs[field_name] = None
+        elif field_name in numeric_compatible_fields:
+            order_kwargs[field_name] = value
+        else:
+            order_kwargs[field_name] = _to_string(value) or None
+
+    return ExcelOrder(**order_kwargs, items=items)
 
 
 mcp = FastMCP(
@@ -1394,17 +1766,31 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
         message_time=request.message_time,
     )
 
-    if request.existing_order is not None:
+    existing_order = request.existing_order
+    draft_row_indexes: list[int] = []
+    if existing_order is None:
+        recent_draft = _find_recent_draft(parsed.order, request.sender_name)
+        if recent_draft:
+            try:
+                existing_order = ExcelOrder.model_validate(recent_draft.get("order") or {})
+                draft_row_indexes = _normalize_row_indexes(recent_draft.get("row_indexes"))
+            except Exception:
+                existing_order = None
+                draft_row_indexes = []
+
+    if existing_order is not None:
         final_order = _merge_orders(
-            existing_order=request.existing_order,
+            existing_order=existing_order,
             new_order=parsed.order,
             sender_name=request.sender_name,
         )
+        if draft_row_indexes:
+            final_order.extra_fields["最近草稿行索引"] = json.dumps(draft_row_indexes, ensure_ascii=False)
         pipeline_action = "merged_then_processed"
         duplicate_order_number = bool(
-            _normalize_value(request.existing_order.单号)
+            _normalize_value(existing_order.单号)
             and _normalize_value(parsed.order.单号)
-            and _same_text(request.existing_order.单号, parsed.order.单号)
+            and _same_text(existing_order.单号, parsed.order.单号)
         )
     else:
         final_order = parsed.order
@@ -1417,14 +1803,20 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
         dry_run=request.dry_run,
     )
     process_payload = json.loads(process_result)
+    if process_payload.get("success") and not request.dry_run:
+        cached_row_indexes = _normalize_row_indexes(process_payload.get("row_indexes"))
+        if not cached_row_indexes:
+            cached_row_indexes = _normalize_row_indexes(process_payload.get("replaced_row_indexes"))
+        _store_recent_draft(final_order, request.sender_name, cached_row_indexes)
+    effective_order_payload = process_payload.get("effective_order") or final_order.to_excel_dict()
     required_fields = ("单号", "销售员", "客户", "货品名称", "数量", "销售金额", "收货人电话", "收货地址")
     missing_fields = [
         field_name
         for field_name in required_fields
-        if _normalize_value(getattr(final_order, field_name)) is None
+        if _normalize_value(effective_order_payload.get(field_name)) is None
     ]
     needs_review = bool(missing_fields)
-    if process_payload.get("success") and process_payload.get("action") == "updated" and not _has_item_details(final_order):
+    if process_payload.get("success") and process_payload.get("action") in {"updated", "replaced"} and not _has_item_details(final_order):
         missing_fields = [field_name for field_name in missing_fields if field_name not in {"货品名称", "数量", "销售金额"}]
         needs_review = bool(missing_fields)
     result = _json_result(
@@ -1433,6 +1825,7 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
         duplicate_order_number=duplicate_order_number,
         needs_review=needs_review,
         missing_fields=missing_fields,
+        message_intent=_to_string(final_order.extra_fields.get("消息意图")),
         parsed_order=parsed.order.to_excel_dict(),
         final_order=final_order.to_excel_dict(),
         process_result=process_payload,
@@ -1469,6 +1862,8 @@ def process_excel_order(
     order_data = row_dicts[0]
     detail_row_count = len(row_dicts)
     has_item_details = _has_item_details(order)
+    message_intent = _to_string(order.extra_fields.get("消息意图")) or ("revise_items" if has_item_details else "supplement")
+    replace_existing_block = message_intent == "replace_order"
     try:
         token = get_token_automatically()
     except Exception as exc:
@@ -1630,13 +2025,51 @@ def process_excel_order(
             return -1, [], None, []
 
         target_salesperson = _to_string(order_data.get("销售员"))
-        found_row_index, existing_row_values, matched_by, matched_row_indexes = _find_matching_row(
-            require_same_salesperson=True
-        )
+        preferred_row_hint = order.extra_fields.get("最近草稿行索引")
+        if isinstance(preferred_row_hint, str):
+            try:
+                preferred_row_hint = json.loads(preferred_row_hint)
+            except Exception:
+                preferred_row_hint = None
+        preferred_row_indexes = _normalize_row_indexes(preferred_row_hint)
+        if preferred_row_indexes:
+            valid_indexes = [idx for idx in preferred_row_indexes if 0 <= idx < len(rows_data)]
+            if valid_indexes:
+                matched_row_indexes = valid_indexes
+                found_row_index = valid_indexes[-1]
+                existing_row_values = rows_data[found_row_index].get("values", [[]])[0]
+                matched_by = "最近草稿"
+
+        if found_row_index == -1:
+            found_row_index, existing_row_values, matched_by, matched_row_indexes = _find_matching_row(
+                require_same_salesperson=True
+            )
         if found_row_index == -1:
             found_row_index, existing_row_values, matched_by, matched_row_indexes = _find_matching_row(
                 require_same_salesperson=False
             )
+
+        effective_order = order
+        effective_row_dicts = row_dicts
+        effective_order_data = order_data
+        if matched_row_indexes:
+            historical_order = _build_order_from_matched_rows(
+                existing_columns=existing_columns,
+                rows_data=rows_data,
+                matched_row_indexes=matched_row_indexes,
+            )
+            effective_order = _merge_orders(
+                existing_order=historical_order,
+                new_order=order,
+                sender_name=_to_string(order_data.get("销售员")) or historical_order.销售员,
+            )
+            effective_row_dicts = _build_excel_row_dicts(effective_order)
+            effective_order_data = effective_row_dicts[0]
+            order = effective_order
+            row_dicts = effective_row_dicts
+            order_data = effective_order_data
+            detail_row_count = len(row_dicts)
+            has_item_details = _has_item_details(order)
 
         if dry_run:
             preview = [{header: row.get(header, "") for header in EXCEL_HEADERS} for row in row_dicts]
@@ -1654,6 +2087,7 @@ def process_excel_order(
                 detail_row_count=detail_row_count,
                 order=order_data,
                 orders=row_dicts,
+                effective_order=order_data,
                 excel_row_preview=preview,
                 auto_add_new_columns=auto_add_new_columns,
                 added_columns=added_columns,
@@ -1753,6 +2187,7 @@ def process_excel_order(
                     skipped_columns=skipped_columns,
                     order=order_data,
                     orders=row_dicts,
+                    effective_order=order_data,
                 )
                 format_ok, format_warning = _format_payment_block(
                     base_url=base_url,
@@ -1767,6 +2202,86 @@ def process_excel_order(
                         format_warning=format_warning,
                     )
                 _append_tool_log("process_excel_order", order_number=order.单号, result_type="updated")
+                return result
+
+            if replace_existing_block and matched_row_indexes:
+                delete_ok, delete_error_payload = _delete_table_rows(
+                    base_url=base_url,
+                    headers=headers,
+                    proxies=proxies,
+                    row_indexes=matched_row_indexes,
+                )
+                if not delete_ok:
+                    _append_tool_log("process_excel_order", order_number=order.单号, result_type="delete_failed")
+                    return delete_error_payload or _json_result(
+                        success=False,
+                        action="delete_failed",
+                        error_type="delete_failed",
+                        message="删除历史订单块失败。",
+                        row_indexes=matched_row_indexes,
+                    )
+
+                row_values_list = [[row_data.get(col_name, "") for col_name in existing_columns] for row_data in row_dicts]
+                remaining_row_count = len(rows_data) - len(matched_row_indexes)
+                created_row_indexes = list(range(remaining_row_count, remaining_row_count + len(row_dicts)))
+                resp_post = requests.post(
+                    f"{base_url}/rows",
+                    headers=headers,
+                    json={"values": row_values_list},
+                    proxies=proxies,
+                    timeout=30,
+                )
+                if resp_post.status_code == 201:
+                    result = _json_result(
+                        success=True,
+                        action="replaced",
+                        message="已删除历史订单块，并按最新明细重建订单。",
+                        matched_by=matched_by,
+                        matched_value=target_order_id or target_customer,
+                        row_index=found_row_index,
+                        row_indexes=created_row_indexes,
+                        replaced_row_indexes=matched_row_indexes,
+                        detail_row_count=detail_row_count,
+                        added_columns=added_columns,
+                        skipped_columns=skipped_columns,
+                        order=order_data,
+                        orders=row_dicts,
+                        effective_order=order_data,
+                        message_intent=message_intent,
+                    )
+                    format_ok, format_warning = _format_payment_block(
+                        base_url=base_url,
+                        headers=headers,
+                        proxies=proxies,
+                        existing_columns=existing_columns,
+                        row_indexes=created_row_indexes,
+                    )
+                    if not format_ok and format_warning:
+                        result = _json_result(
+                            **json.loads(result),
+                            format_warning=format_warning,
+                        )
+                    _append_tool_log("process_excel_order", order_number=order.单号, result_type="replaced")
+                    return result
+
+                error_type, error_message = _classify_graph_error(
+                    resp_post.status_code,
+                    resp_post.text,
+                    operation="create",
+                )
+                result = _json_result(
+                    success=False,
+                    action="create_failed",
+                    error_type=error_type,
+                    message=error_message,
+                    matched_by=matched_by,
+                    matched_value=target_order_id or target_customer,
+                    row_index=found_row_index,
+                    row_indexes=matched_row_indexes,
+                    status_code=resp_post.status_code,
+                    detail=resp_post.text,
+                )
+                _append_tool_log("process_excel_order", order_number=order.单号, result_type=error_type)
                 return result
 
             if len(matched_row_indexes) not in (0, detail_row_count):
@@ -1836,6 +2351,7 @@ def process_excel_order(
                 skipped_columns=skipped_columns,
                 order=order_data,
                 orders=row_dicts,
+                effective_order=order_data,
             )
             format_ok, format_warning = _format_payment_block(
                 base_url=base_url,
@@ -1874,6 +2390,7 @@ def process_excel_order(
                 skipped_columns=skipped_columns,
                 order=order_data,
                 orders=row_dicts,
+                effective_order=order_data,
             )
             format_ok, format_warning = _format_payment_block(
                 base_url=base_url,

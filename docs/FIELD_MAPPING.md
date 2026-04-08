@@ -49,7 +49,7 @@ These fields may appear in MCP tool payloads but are not written to the 22 Excel
 
 | Field | Meaning |
 | --- | --- |
-| `匹配客户别名` | Customer alias extracted from order number suffix such as `260313-05（B&D）` |
+| `匹配客户别名` | Customer alias extracted from order number suffix such as `260313-05（示例客户A）` |
 | `extra_fields` | Extra Excel columns not included in the fixed 22 headers |
 
 ## Quantity Unit Rule / 数量单位规则

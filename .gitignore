@@ -8,4 +8,5 @@ __pycache__/
 *.swo
 *.egg-info/
 onedrive_token_cache.bin
+order_draft_cache.json
 .DS_Store

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added / 新增
+
+- Added a repository `TODO.md` with high-, medium-, and low-priority roadmap items
+- 新增仓库级 `TODO.md`，按高、中、低优先级整理后续路线图
+- Added a local recent-draft cache for split image/text order follow-ups so supplement messages can reuse the latest matching draft before Excel matching
+- 新增本地“最近草稿缓存”，用于处理图片和补充文字分开发送的场景，让后续补充消息在匹配 Excel 之前先复用最近草稿
+- Added `.gitignore` coverage for the runtime draft cache file `order_draft_cache.json`
+- 为运行期草稿缓存文件 `order_draft_cache.json` 补充了 `.gitignore` 忽略规则
+
 ### Changed / 变更
 
 - Quantity units are now parsed generically from the text immediately following the quantity number, while parenthetical notes are ignored for the unit field
@@ -15,6 +24,10 @@ All notable changes to this project will be documented in this file.
 - 现在无需 `收货地址:` 前缀，也可以识别独立地址行
 - Supplement-only follow-up messages can now update shared fields across an existing multi-line order block without requiring item-line counts to match
 - 仅补充单号/收款/联系人/地址的后续消息，现在可以直接更新已有多行订单块的共享字段，不再要求商品行数一致
+- Historical multi-line order blocks are now rebuilt into typed `ExcelOrder` objects using safer string coercion for shared fields such as dates and phone numbers
+- 回填历史多行订单块时，现在会把日期、电话等共享字段安全地转换为字符串，再构造成 `ExcelOrder`，避免类型校验中断补单
+- Split-send supplement messages now try to inherit and merge the latest draft block for the same salesperson and customer/order before falling back to pure Excel matching
+- 图片先发、文字后补的消息现在会优先继承并合并同一销售员下最近的草稿订单块，再回退到 Excel 匹配
 
 ## [0.1.2] - 2026-03-30
 

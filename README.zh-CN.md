@@ -6,6 +6,7 @@
 
 字段映射文档：[docs/FIELD_MAPPING.md](docs/FIELD_MAPPING.md)
 OpenClaw 接入文档：[docs/OPENCLAW_INTEGRATION.zh-CN.md](docs/OPENCLAW_INTEGRATION.zh-CN.md)
+项目待办文档：[TODO.md](TODO.md)
 
 ## 项目简介
 

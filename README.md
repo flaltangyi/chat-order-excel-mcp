@@ -6,6 +6,7 @@ MCP server for parsing WeChat order messages, merging follow-up updates, and wri
 
 Field mapping: [docs/FIELD_MAPPING.md](docs/FIELD_MAPPING.md)
 OpenClaw integration: [docs/OPENCLAW_INTEGRATION.md](docs/OPENCLAW_INTEGRATION.md)
+Project roadmap: [TODO.md](TODO.md)
 
 ## Overview
 
