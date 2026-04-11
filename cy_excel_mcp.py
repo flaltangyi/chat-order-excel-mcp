@@ -356,10 +356,35 @@ def _is_noise_line(line: str) -> bool:
     return False
 
 
+def _normalize_replace_target(text: str | None) -> str | None:
+    normalized = _normalize_value(text)
+    if normalized is None:
+        return None
+
+    cleaned = str(normalized).strip()
+    replace_suffixes = (
+        "以这个为准",
+        "这个为准",
+        "以这个为主",
+        "这个为主",
+        "以上面这个为准",
+        "以下图为准",
+        "按这个为准",
+        "前面的作废",
+        "之前那个作废",
+        "修改订单",
+    )
+    for suffix in replace_suffixes:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip(" ：:，,；;。.")
+            break
+    return _normalize_value(cleaned)
+
+
 def _extract_customer_name(text: str) -> str | None:
     customer = _extract_first(r"客户[:：]\s*(.+)", text)
     if customer:
-        return customer
+        return _normalize_replace_target(customer)
 
     lines = [_normalize_ocr_line(line) for line in text.splitlines() if line.strip()]
     for line in lines:
@@ -367,7 +392,7 @@ def _extract_customer_name(text: str) -> str | None:
             continue
         if re.search(r"\d", line):
             continue
-        return _normalize_value(line)
+        return _normalize_replace_target(line)
     return None
 
 
@@ -1031,17 +1056,35 @@ def _delete_table_rows(
     row_indexes: list[int],
 ) -> tuple[bool, str | None]:
     for row_index in sorted(row_indexes, reverse=True):
-        resp_delete = requests.post(
-            f"{base_url}/rows/itemAt(index={row_index})/delete",
-            headers=headers,
-            json={},
-            proxies=proxies,
-            timeout=30,
+        delete_attempts = (
+            ("delete", f"{base_url}/rows/itemAt(index={row_index})", None),
+            ("delete", f"{base_url}/rows/{row_index}", None),
+            ("post", f"{base_url}/rows/itemAt(index={row_index})/delete", {}),
         )
-        if resp_delete.status_code not in (200, 204):
+        last_response: requests.Response | None = None
+        for method, url, payload in delete_attempts:
+            if method == "delete":
+                resp_delete = requests.delete(
+                    url,
+                    headers=headers,
+                    proxies=proxies,
+                    timeout=30,
+                )
+            else:
+                resp_delete = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    proxies=proxies,
+                    timeout=30,
+                )
+            last_response = resp_delete
+            if resp_delete.status_code in (200, 202, 204):
+                break
+        else:
             error_type, error_message = _classify_graph_error(
-                resp_delete.status_code,
-                resp_delete.text,
+                last_response.status_code if last_response is not None else 500,
+                last_response.text if last_response is not None else "delete row failed",
                 operation="update",
             )
             return False, _json_result(
@@ -1051,8 +1094,8 @@ def _delete_table_rows(
                 message=error_message,
                 row_index=row_index,
                 row_indexes=row_indexes,
-                status_code=resp_delete.status_code,
-                detail=resp_delete.text,
+                status_code=last_response.status_code if last_response is not None else 500,
+                detail=last_response.text if last_response is not None else "delete row failed",
             )
     return True, None
 
@@ -1803,7 +1846,16 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
         dry_run=request.dry_run,
     )
     process_payload = json.loads(process_result)
-    if process_payload.get("success") and not request.dry_run:
+    should_cache_draft = process_payload.get("success")
+    if (
+        not should_cache_draft
+        and process_payload.get("action") == "needs_review"
+        and process_payload.get("error_type") == "row_count_mismatch"
+        and _has_item_details(final_order)
+    ):
+        should_cache_draft = True
+
+    if should_cache_draft and not request.dry_run:
         cached_row_indexes = _normalize_row_indexes(process_payload.get("row_indexes"))
         if not cached_row_indexes:
             cached_row_indexes = _normalize_row_indexes(process_payload.get("replaced_row_indexes"))
@@ -2035,8 +2087,17 @@ def process_excel_order(
         if preferred_row_indexes:
             valid_indexes = [idx for idx in preferred_row_indexes if 0 <= idx < len(rows_data)]
             if valid_indexes:
-                matched_row_indexes = valid_indexes
-                found_row_index = valid_indexes[-1]
+                expanded_indexes = _collect_matching_row_indexes(
+                    valid_indexes[-1],
+                    require_same_salesperson=bool(target_salesperson),
+                )
+                if len(expanded_indexes) <= 1 and target_salesperson:
+                    expanded_indexes = _collect_matching_row_indexes(
+                        valid_indexes[-1],
+                        require_same_salesperson=False,
+                    )
+                matched_row_indexes = expanded_indexes or valid_indexes
+                found_row_index = matched_row_indexes[-1]
                 existing_row_values = rows_data[found_row_index].get("values", [[]])[0]
                 matched_by = "最近草稿"
 

@@ -28,6 +28,10 @@ All notable changes to this project will be documented in this file.
 - 回填历史多行订单块时，现在会把日期、电话等共享字段安全地转换为字符串，再构造成 `ExcelOrder`，避免类型校验中断补单
 - Split-send supplement messages now try to inherit and merge the latest draft block for the same salesperson and customer/order before falling back to pure Excel matching
 - 图片先发、文字后补的消息现在会优先继承并合并同一销售员下最近的草稿订单块，再回退到 Excel 匹配
+- Replace-confirmation messages such as `客户名以这个为准` now normalize the customer target correctly, cache pending replacement drafts, and expand cached row hints back into the full historical order block before replacement
+- `客户名以这个为准` 这类确认替换消息现在会正确提取客户名、缓存待替换草稿，并在真正替换前把缓存行索引扩展回完整历史订单块
+- Replace-order deletion now uses working Graph row deletion paths, allowing old multi-line blocks to be removed before rebuilding the latest single-line or revised order
+- 替换订单时现在改用可用的 Graph 行删除路径，能够先删除旧的多行订单块，再重建最新的一行或修订版订单
 
 ## [0.1.2] - 2026-03-30
 
