@@ -9,4 +9,6 @@ __pycache__/
 *.egg-info/
 onedrive_token_cache.bin
 order_draft_cache.json
+product_catalog_cache.json
+product_aliases.json
 .DS_Store

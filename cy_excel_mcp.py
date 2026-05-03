@@ -4,7 +4,10 @@ import json
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import quote
 
@@ -28,12 +31,24 @@ SCOPES = ["Files.ReadWrite.All"]
 CACHE_FILE = os.getenv("OC_OD_CACHE_FILE", "onedrive_token_cache.bin")
 FILE_PATH = os.getenv("OC_OD_FILE_PATH", "订单汇总.xlsx")
 TABLE_NAME = os.getenv("OC_OD_TABLE_NAME", "表4")
+PRODUCT_FILE_PATH = os.getenv("OC_OD_PRODUCT_FILE_PATH", "众一/2026诚亿报表.xlsx")
+PRODUCT_SHEET_NAME = os.getenv("OC_OD_PRODUCT_SHEET_NAME", "产品明细")
+PRODUCT_NAME_COLUMN = os.getenv("OC_OD_PRODUCT_NAME_COLUMN", "B")
+PRODUCT_CATEGORY_COLUMN = os.getenv("OC_OD_PRODUCT_CATEGORY_COLUMN", "C")
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 DEFAULT_HOST = os.getenv("CY_EXCEL_MCP_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("CY_EXCEL_MCP_PORT", "18061"))
 LOGS_DIR = os.path.join(os.getcwd(), "logs")
 DRAFT_CACHE_FILE = os.path.join(os.getcwd(), os.getenv("CY_EXCEL_MCP_DRAFT_CACHE_FILE", "order_draft_cache.json"))
 DRAFT_CACHE_TTL_SECONDS = int(os.getenv("CY_EXCEL_MCP_DRAFT_CACHE_TTL_SECONDS", str(2 * 60 * 60)))
+PRODUCT_CACHE_FILE = os.path.join(os.getcwd(), os.getenv("CY_PRODUCT_CACHE_FILE", "product_catalog_cache.json"))
+PRODUCT_ALIAS_FILE = os.path.join(os.getcwd(), os.getenv("CY_PRODUCT_ALIAS_FILE", "product_aliases.json"))
+DEFAULT_PRODUCT_ALIASES = {
+    "98-400": "98400-14oz-400ml",
+    "98-400pet": "98400-14oz-400ml",
+    "定制98-400杯": "98400-14oz-400ml",
+    "98-400ml": "98400-14oz-400ml",
+}
 EXCEL_HEADERS = [
     "备注",
     "发货厂家",
@@ -81,6 +96,13 @@ def _load_json_file(path: str) -> Any:
 
 def _write_json_file(path: str, payload: Any) -> None:
     _write_text_file(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _normalize_onedrive_path(path: str | None) -> str:
+    normalized = _normalize_value(path)
+    if normalized is None:
+        return ""
+    return str(normalized).replace("\\", "/").strip("/")
 
 
 def _build_msal_http_client() -> requests.Session:
@@ -174,6 +196,9 @@ def _store_recent_draft(
     order: "ExcelOrder",
     sender_name: str | None,
     row_indexes: list[int] | None = None,
+    historical_row_indexes: list[int] | None = None,
+    pending_replace: bool = False,
+    matched_by: str | None = None,
 ) -> None:
     records = _load_recent_draft_records()
     normalized_sender = _normalize_match_text(sender_name or order.销售员)
@@ -206,13 +231,20 @@ def _store_recent_draft(
             "customer": order.客户,
             "customer_alias": order.匹配客户别名,
             "row_indexes": row_indexes or [],
+            "historical_row_indexes": historical_row_indexes or [],
+            "pending_replace": pending_replace,
+            "matched_by": matched_by,
+            "message_intent": _to_string(order.extra_fields.get("消息意图")),
             "order": order.model_dump(exclude_none=True),
         }
     )
     _save_recent_draft_records(filtered_records)
 
-
-def _find_recent_draft(order: "ExcelOrder", sender_name: str | None) -> dict[str, Any] | None:
+def _find_recent_draft(
+    order: "ExcelOrder",
+    sender_name: str | None,
+    prefer_pending_replace: bool = False,
+) -> dict[str, Any] | None:
     normalized_sender = _normalize_match_text(sender_name or order.销售员)
     normalized_order_number = _normalize_match_text(order.单号)
     normalized_customer = _normalize_match_text(order.客户)
@@ -231,13 +263,17 @@ def _find_recent_draft(order: "ExcelOrder", sender_name: str | None) -> dict[str
         if normalized_sender and _normalize_match_text(record.get("sender_name")) != normalized_sender:
             continue
 
+        pending_score = 0
+        if prefer_pending_replace:
+            pending_score = 100 if bool(record.get("pending_replace")) else -100
+
         score = -1
         if normalized_order_number and _normalize_match_text(record.get("order_number")) == normalized_order_number:
-            score = 3
+            score = pending_score + 3
         elif normalized_customer and _normalize_match_text(record.get("customer")) == normalized_customer:
-            score = 2
+            score = pending_score + 2
         elif normalized_alias and _normalize_match_text(record.get("customer_alias")) == normalized_alias:
-            score = 1
+            score = pending_score + 1
 
         if score > best_score:
             best_score = score
@@ -268,6 +304,31 @@ def _format_money(value: float | None) -> str | None:
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
+def _format_unit_price(value: Any) -> str | None:
+    normalized = _normalize_value(value)
+    if normalized is None:
+        return None
+
+    if isinstance(normalized, (int, float)):
+        raw_number = str(normalized)
+    else:
+        cleaned = str(normalized).replace("元", "").replace(",", "").strip()
+        match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        if not match:
+            return None
+        raw_number = match.group()
+
+    try:
+        decimal_value = Decimal(raw_number)
+    except (InvalidOperation, ValueError):
+        return None
+
+    formatted = format(decimal_value.normalize(), "f")
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return _normalize_value(formatted)
+
+
 def _extract_first(pattern: str, text: str, flags: int = 0) -> str | None:
     match = re.search(pattern, text, flags)
     if not match:
@@ -275,8 +336,11 @@ def _extract_first(pattern: str, text: str, flags: int = 0) -> str | None:
     return match.group(1).strip()
 
 
+PHONE_PATTERN = re.compile(r"(?<!\d)(1\d{10})(?!\d)")
+
+
 def _extract_phone(text: str) -> str | None:
-    match = re.search(r"(?<!\d)(1\d{10})(?!\d)", text)
+    match = PHONE_PATTERN.search(text)
     return match.group(1) if match else None
 
 
@@ -284,19 +348,33 @@ def _same_text(left: str | None, right: str | None) -> bool:
     return _to_string(left) == _to_string(right)
 
 
+def _normalize_entity_name(value: str | None) -> str | None:
+    normalized = _normalize_value(value)
+    if normalized is None:
+        return None
+    cleaned = unicodedata.normalize("NFKC", str(normalized)).strip()
+    cleaned = re.sub(r"^[\"'“”‘’\s]+|[\"'“”‘’\s]+$", "", cleaned)
+    cleaned = cleaned.strip(" ：:，,；;。.\t\r\n")
+    return _normalize_value(cleaned)
+
+
 def _extract_order_number_and_customer_alias(text: str) -> tuple[str | None, str | None]:
-    raw_order_number = _extract_first(r"单号[:：]\s*(.+)", text)
+    raw_order_number = _extract_first(r"单号[:：]\s*([^\r\n]+)", text)
     if raw_order_number is None:
         return None, None
 
-    normalized_order_number = raw_order_number.strip()
+    normalized_order_number = unicodedata.normalize("NFKC", raw_order_number).strip(" ：:，,；;。.\t\r\n")
     alias = None
-    alias_match = re.search(r"[（(]([^()（）]+)[)）]\s*$", normalized_order_number)
+    alias_match = re.search(r"[（(]([^()（）]+)[)）]\s*[，,；;。.\s]*$", normalized_order_number)
     if alias_match:
-        alias = _normalize_value(alias_match.group(1))
-        normalized_order_number = re.sub(r"\s*[（(][^()（）]+[)）]\s*$", "", normalized_order_number).strip()
+        alias = _normalize_entity_name(alias_match.group(1))
+        normalized_order_number = re.sub(
+            r"\s*[（(][^()（）]+[)）]\s*[，,；;。.\s]*$",
+            "",
+            normalized_order_number,
+        ).strip(" ：:，,；;。.\t\r\n")
 
-    return _normalize_value(normalized_order_number), alias
+    return _normalize_entity_name(normalized_order_number), alias
 
 
 def _normalize_ocr_line(line: str) -> str:
@@ -332,6 +410,9 @@ def _is_noise_line(line: str) -> bool:
         "电话",
         "收货地址",
         "地址",
+        "所在地区",
+        "所在地址",
+        "地区",
         "全款",
         "总货款",
         "合计",
@@ -342,6 +423,9 @@ def _is_noise_line(line: str) -> bool:
         "备注",
     )
     if cleaned.startswith(keyword_prefixes):
+        return True
+
+    if PHONE_PATTERN.search(cleaned):
         return True
 
     if lower_cleaned.startswith("item ") or lower_cleaned.startswith("product "):
@@ -378,11 +462,11 @@ def _normalize_replace_target(text: str | None) -> str | None:
         if cleaned.endswith(suffix):
             cleaned = cleaned[: -len(suffix)].strip(" ：:，,；;。.")
             break
-    return _normalize_value(cleaned)
+    return _normalize_entity_name(cleaned)
 
 
 def _extract_customer_name(text: str) -> str | None:
-    customer = _extract_first(r"客户[:：]\s*(.+)", text)
+    customer = _extract_first(r"客户[:：]\s*([^\r\n]+)", text)
     if customer:
         return _normalize_replace_target(customer)
 
@@ -390,26 +474,76 @@ def _extract_customer_name(text: str) -> str | None:
     for line in lines:
         if _is_noise_line(line):
             continue
+        if _looks_like_address(line):
+            continue
         if re.search(r"\d", line):
             continue
         return _normalize_replace_target(line)
     return None
 
 
+def _clean_contact_name(value: str | None) -> str | None:
+    normalized = _normalize_entity_name(value)
+    if normalized is None:
+        return None
+
+    cleaned = PHONE_PATTERN.sub("", normalized)
+    cleaned = re.sub(
+        r"^(?:收件人|收货人|收货联系人|联系人|姓名|手机号码|手机号|电话号码|电话)[:：]?\s*",
+        "",
+        cleaned,
+    )
+    cleaned = cleaned.strip(" ：:，,；;。.\t\r\n")
+    if not cleaned:
+        return None
+    if "收款" in cleaned:
+        return None
+    if re.search(r"\d", cleaned):
+        return None
+    if _looks_like_address(cleaned):
+        return None
+    if len(cleaned) > 30:
+        return None
+    return _normalize_entity_name(cleaned)
+
+
 def _extract_contact_name(text: str) -> str | None:
     explicit = (
-        _extract_first(r"收件人[:：]\s*(.+)", text)
-        or _extract_first(r"收货人[:：]\s*(.+)", text)
-        or _extract_first(r"收货联系人[:：]\s*(.+)", text)
+        _extract_first(r"收件人[:：]\s*([^\r\n]+)", text)
+        or _extract_first(r"收货人[:：]\s*([^\r\n]+)", text)
+        or _extract_first(r"收货联系人[:：]\s*([^\r\n]+)", text)
     )
     if explicit:
-        return explicit
-
-    phone_line_match = re.search(r"1\d{10}[，,\s]+([^\n]+)", text)
-    if phone_line_match:
-        contact = _normalize_value(phone_line_match.group(1))
-        if contact and len(contact) <= 20:
+        contact = _clean_contact_name(explicit)
+        if contact:
             return contact
+
+    lines = [_normalize_ocr_line(line) for line in text.splitlines() if line.strip()]
+    for line in lines:
+        if not PHONE_PATTERN.search(line):
+            continue
+
+        after_phone = re.search(r"(?<!\d)1\d{10}(?!\d)[，,；;\s]+([^\r\n]+)", line)
+        if after_phone:
+            contact = _clean_contact_name(after_phone.group(1))
+            if contact:
+                return contact
+
+        before_phone = re.search(r"([^\r\n，,；;:：]{1,30})[，,；;\s]+(?<!\d)1\d{10}(?!\d)", line)
+        if before_phone:
+            contact = _clean_contact_name(before_phone.group(1))
+            if contact:
+                return contact
+
+    for index, line in enumerate(lines):
+        if not PHONE_PATTERN.search(line):
+            continue
+        for neighbor_index in (index - 1, index + 1):
+            if neighbor_index < 0 or neighbor_index >= len(lines):
+                continue
+            contact = _clean_contact_name(lines[neighbor_index])
+            if contact:
+                return contact
     return None
 
 
@@ -439,7 +573,7 @@ def _looks_like_address(line: str) -> bool:
 
 
 def _extract_address(text: str) -> str | None:
-    explicit = _extract_first(r"(?:收货地址|地址)[:：]\s*(.+)", text)
+    explicit = _extract_first(r"(?:收货地址|地址|所在地区|地区|所在地址)[:：]\s*(.+)", text)
     if explicit:
         return explicit
 
@@ -475,6 +609,10 @@ def _normalize_quantity_unit(raw: str | None) -> str | None:
     return _normalize_value(unit_text)
 
 
+def _is_plate_fee_name(value: Any) -> bool:
+    return "版费" in _to_string(value)
+
+
 class OrderItem(BaseModel):
     货品名称: str
     数量: str | None = None
@@ -487,7 +625,7 @@ class OrderItem(BaseModel):
             货品名称=_to_string(self.货品名称),
             数量=_normalize_value(self.数量),
             数量单位=_normalize_quantity_unit(self.数量单位),
-            销售单价=_format_money(_to_float(self.销售单价)),
+            销售单价=_format_unit_price(self.销售单价),
             销售金额=_format_money(_to_float(self.销售金额)),
         )
 
@@ -502,10 +640,35 @@ class OrderItem(BaseModel):
         )
 
 
+def _parse_plate_fee_item_from_line(line: str) -> OrderItem | None:
+    normalized = _normalize_ocr_line(line)
+    if "版费" not in normalized:
+        return None
+
+    fee_text = normalized[normalized.find("版费") :]
+    money_matches = re.findall(r"(?:￥|¥)?\s*(\d+(?:\.\d+)?)\s*元", fee_text)
+    number_matches = re.findall(r"\d+(?:\.\d+)?", fee_text)
+    amount = money_matches[-1] if money_matches else (number_matches[-1] if number_matches else None)
+    if amount is None:
+        return None
+
+    return OrderItem(
+        货品名称="版费",
+        数量="1",
+        数量单位="项",
+        销售单价=amount,
+        销售金额=amount,
+    ).normalized()
+
+
 def _parse_item_from_structured_line(line: str) -> OrderItem | None:
     normalized = _normalize_ocr_line(line)
     if not normalized:
         return None
+
+    plate_fee_item = _parse_plate_fee_item_from_line(normalized)
+    if plate_fee_item is not None:
+        return plate_fee_item
 
     stripped = re.sub(r"^(商品|货品|产品|item|product)\s*\d*\s*[:：]\s*", "", normalized, flags=re.IGNORECASE)
     if stripped != normalized and ("数量" in stripped or "金额" in stripped):
@@ -529,6 +692,10 @@ def _parse_item_from_table_line(line: str) -> OrderItem | None:
     normalized = _normalize_ocr_line(line)
     if _is_noise_line(normalized):
         return None
+
+    plate_fee_item = _parse_plate_fee_item_from_line(normalized)
+    if plate_fee_item is not None:
+        return plate_fee_item
 
     match = re.match(
         r"^(?P<name>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[^\d\s]+(?:\([^)]*\))?)?\s+"
@@ -670,6 +837,17 @@ def _detect_message_intent(raw_message: str, has_item_details: bool) -> str:
     if has_item_details:
         return "revise_items"
     return "supplement"
+
+
+# Long-term order-change mode / 长周期改单模式
+# - 短周期（图片先发、文字后补）仍优先复用最近草稿缓存。
+# - 长周期改单时，不能只依赖最近草稿；当业务员引用旧图片/旧文本并补一句
+#   “客户名以这个为准 / 这个为准客户名”时，应优先扫描 Excel 历史订单块。
+# - 主匹配锚点应是：销售员 + 客户 + 匹配客户别名；单号存在时单号优先。
+# - 一旦明确是 replace_order，就应把命中的整块历史订单视为可替换块，
+#   而不是继续要求新旧明细行数一致。
+# - 最近草稿缓存只作为短期加速器；若缓存已过期、缺失、或与历史块冲突，
+#   应回退到 Excel 历史匹配并记录替换审计信息。
 
 
 def _normalize_date(date_text: str | None, message_time: str | None) -> str | None:
@@ -892,7 +1070,7 @@ def get_token_automatically() -> str | None:
 
 
 def _build_base_url() -> str:
-    return f"{GRAPH_ROOT}/me/drive/root:/{FILE_PATH}:/workbook/tables('{TABLE_NAME}')"
+    return f"{GRAPH_ROOT}/me/drive/root:/{_normalize_onedrive_path(FILE_PATH)}:/workbook/tables('{TABLE_NAME}')"
 
 
 def _column_index_to_letter(index: int) -> str:
@@ -904,6 +1082,16 @@ def _column_index_to_letter(index: int) -> str:
     return result
 
 
+def _column_letters_to_index(letters: str) -> int:
+    normalized = _to_string(letters).upper().replace("$", "")
+    if not re.fullmatch(r"[A-Z]+", normalized):
+        raise ValueError(f"Invalid Excel column letters: {letters}")
+    index = 0
+    for char in normalized:
+        index = index * 26 + (ord(char) - 64)
+    return index - 1
+
+
 def _parse_table_range_address(address: str) -> tuple[str, int, int] | None:
     normalized = address.strip()
     match = re.match(r"^(?P<sheet>.+)!(?P<start_col>\$?[A-Z]+)\$?(?P<start_row>\d+):", normalized)
@@ -913,10 +1101,7 @@ def _parse_table_range_address(address: str) -> tuple[str, int, int] | None:
     start_col_letters = match.group("start_col").replace("$", "")
     start_row = int(match.group("start_row"))
 
-    start_col_index = 0
-    for char in start_col_letters:
-        start_col_index = start_col_index * 26 + (ord(char) - 64)
-    start_col_index -= 1
+    start_col_index = _column_letters_to_index(start_col_letters)
     return sheet_name, start_col_index, start_row
 
 
@@ -1049,6 +1234,81 @@ def _format_payment_block(
     return True, None
 
 
+def _format_unit_price_cells(
+    base_url: str,
+    headers: dict[str, str],
+    proxies: dict[str, str | None],
+    existing_columns: list[str],
+    row_indexes: list[int],
+) -> tuple[bool, str | None]:
+    if "销售单价" not in existing_columns or not row_indexes:
+        return True, None
+
+    layout = _get_table_layout(base_url, headers, proxies)
+    if layout is None:
+        return False, "无法定位 Excel 表格所在工作表，跳过销售单价显示格式设置。"
+
+    sheet_name, start_col_index, header_row, worksheet_id = layout
+    data_start_row = header_row + 1
+    first_row = data_start_row + min(row_indexes)
+    last_row = data_start_row + max(row_indexes)
+    column_index = start_col_index + existing_columns.index("销售单价")
+    column_letter = _column_index_to_letter(column_index)
+    simple_range = f"{column_letter}{first_row}:{column_letter}{last_row}"
+    row_count = last_row - first_row + 1
+    payload = {"numberFormat": [["0.######"] for _ in range(row_count)]}
+
+    range_bases: list[str] = []
+    if worksheet_id:
+        range_bases.append(
+            f"{GRAPH_ROOT}/me/drive/root:/{FILE_PATH}:/workbook/worksheets/"
+            f"{quote(worksheet_id, safe='')}/range(address='{simple_range}')"
+        )
+    range_bases.append(
+        f"{GRAPH_ROOT}/me/drive/root:/{FILE_PATH}:/workbook/worksheets/"
+        f"{quote(sheet_name, safe='')}/range(address='{simple_range}')"
+    )
+
+    last_error = None
+    for range_base in range_bases:
+        resp_patch = requests.patch(
+            range_base,
+            headers=headers,
+            json=payload,
+            proxies=proxies,
+            timeout=30,
+        )
+        if resp_patch.status_code == 200:
+            return True, None
+        last_error = f"销售单价显示格式设置失败（status={resp_patch.status_code}）。"
+
+    return False, last_error or "销售单价显示格式设置失败。"
+
+
+def _format_order_rows(
+    base_url: str,
+    headers: dict[str, str],
+    proxies: dict[str, str | None],
+    existing_columns: list[str],
+    row_indexes: list[int],
+) -> tuple[bool, str | None]:
+    warnings: list[str] = []
+    for formatter in (_format_payment_block, _format_unit_price_cells):
+        ok, warning = formatter(
+            base_url=base_url,
+            headers=headers,
+            proxies=proxies,
+            existing_columns=existing_columns,
+            row_indexes=row_indexes,
+        )
+        if not ok and warning:
+            warnings.append(warning)
+
+    if warnings:
+        return False, "；".join(warnings)
+    return True, None
+
+
 def _delete_table_rows(
     base_url: str,
     headers: dict[str, str],
@@ -1101,8 +1361,624 @@ def _delete_table_rows(
 
 
 def _build_workbook_base_url(file_path: str | None = None) -> str:
-    target_file_path = file_path or FILE_PATH
+    target_file_path = _normalize_onedrive_path(file_path or FILE_PATH)
     return f"{GRAPH_ROOT}/me/drive/root:/{target_file_path}:/workbook"
+
+
+def _build_drive_item_urls(file_path: str) -> list[str]:
+    target_file_path = _normalize_onedrive_path(file_path)
+    return [
+        f"{GRAPH_ROOT}/me/drive/root:/{target_file_path}",
+        f"{GRAPH_ROOT}/me/drive/root:/{target_file_path}:",
+    ]
+
+
+def _graph_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _normalize_product_key(value: Any) -> str:
+    text = _to_string(value)
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text).casefold()
+    text = text.replace("毫升", "ml")
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[·•,，.。;；:：_/\|\\()\[\]{}（）【】<>《》\"'`~!！?？+]", "", text)
+    text = text.replace("-", "")
+    text = text.replace("订制", "定制")
+    return text
+
+
+def _product_numeric_codes(value: Any) -> set[str]:
+    text = unicodedata.normalize("NFKC", _to_string(value))
+    numbers = [item.replace(".", "") for item in re.findall(r"\d+(?:\.\d+)?", text)]
+    codes = {number for number in numbers if len(number) >= 4}
+    if len(numbers) >= 2:
+        codes.add(numbers[0].lstrip("0") + numbers[1].lstrip("0"))
+    return {code for code in codes if code}
+
+
+def _category_family(value: Any) -> str:
+    category = _normalize_product_key(value)
+    if not category:
+        return ""
+    if "盖" in category:
+        if "注塑" in category:
+            return "注塑盖"
+        if "pet" in category:
+            return "PET盖"
+        return "盖"
+    if "杯" in category or "pet" == category:
+        if "纸" in category:
+            return "纸杯"
+        if "注塑" in category:
+            return "注塑杯"
+        if "吸塑" in category:
+            return "吸塑杯"
+        if "pet" in category:
+            return "PET杯"
+        return "杯"
+    if "吸管" in category or "管" == category:
+        if "降解" in category:
+            return "可降解吸管"
+        return "吸管"
+    if "袋" in category:
+        if "纸" in category:
+            return "纸袋"
+        if "无纺布" in category:
+            return "无纺布袋"
+        return "袋"
+    if "防漏纸" in category:
+        return "防漏纸"
+    if "膜" in category:
+        return "膜"
+    if "费用" in category or "费" in category or "定金" in category:
+        return "费用"
+    return category
+
+
+def _infer_product_family(raw_name: Any) -> str:
+    text = _normalize_product_key(raw_name)
+    if not text:
+        return ""
+    if "盖" in text:
+        if "注塑" in text:
+            return "注塑盖"
+        if "pet" in text or "直饮" in text or "拱" in text or "平" in text or "外扣" in text:
+            return "PET盖"
+        return "盖"
+    if "吸管" in text or re.search(r"(大管|小管|粗管|细管|单支.*管)", text):
+        return "可降解吸管" if "降解" in text else "吸管"
+    if "袋" in text:
+        if "纸" in text or "牛皮" in text or "白皮" in text:
+            return "纸袋"
+        if "无纺布" in text or "保温袋" in text:
+            return "无纺布袋"
+        return "袋"
+    if "防漏纸" in text or "锡纸" in text:
+        return "防漏纸"
+    if "纸杯" in text or "淋膜" in text or "单层" in text or "双层" in text:
+        return "纸杯"
+    if "注塑" in text or "鸳鸯杯" in text or "方瓶" in text or "膜内贴" in text:
+        return "注塑杯"
+    if "吸塑" in text:
+        return "吸塑杯"
+    if "pet" in text:
+        return "PET杯"
+    if "杯" in text or "ml" in text or "oz" in text or re.search(r"^\d{2,3}[-]?\d{2,4}", text):
+        return "杯"
+    return ""
+
+
+def _category_match_score(raw_name: Any, category: Any) -> float:
+    inferred = _infer_product_family(raw_name)
+    if not inferred:
+        return 0.0
+    family = _category_family(category)
+    if not family:
+        return 0.0
+    if inferred == family:
+        return 1.0
+    if inferred in family or family in inferred:
+        return 0.75
+    if inferred.endswith("盖") and family.endswith("盖"):
+        return 0.55
+    if inferred.endswith("杯") and family.endswith("杯"):
+        return 0.55
+    if inferred in {"吸管", "可降解吸管"} and family in {"吸管", "可降解吸管"}:
+        return 0.55
+    if inferred == "袋" and family.endswith("袋"):
+        return 0.45
+    return -0.35
+
+
+def _product_similarity_score(raw_name: Any, product_name: Any) -> float:
+    raw_key = _normalize_product_key(raw_name)
+    product_key = _normalize_product_key(product_name)
+    if not raw_key or not product_key:
+        return 0.0
+    if raw_key == product_key:
+        return 1.0
+
+    sequence_score = SequenceMatcher(None, raw_key, product_key).ratio()
+    raw_chars = set(raw_key)
+    product_chars = set(product_key)
+    char_overlap = len(raw_chars.intersection(product_chars)) / max(len(raw_chars), 1)
+    containment = 1.0 if raw_key in product_key or product_key in raw_key else 0.0
+    score = (sequence_score * 0.65) + (char_overlap * 0.25) + (containment * 0.10)
+
+    raw_codes = _product_numeric_codes(raw_name)
+    product_codes = _product_numeric_codes(product_name)
+    if raw_codes and (
+        raw_codes.intersection(product_codes)
+        or any(code in product_key for code in raw_codes)
+    ):
+        score = max(score, 0.92)
+
+    return round(min(score, 1.0), 3)
+
+
+def _product_match_score(raw_name: Any, product_entry: dict[str, Any]) -> float:
+    product_name = product_entry.get("name")
+    base_score = _product_similarity_score(raw_name, product_name)
+    category_score = _category_match_score(raw_name, product_entry.get("category"))
+    if category_score > 0:
+        base_score += category_score * 0.08
+    elif category_score < 0:
+        base_score += category_score * 0.18
+    return round(max(0.0, min(base_score, 1.0)), 3)
+
+
+def _load_product_aliases() -> dict[str, str]:
+    aliases: dict[str, str] = {
+        _normalize_product_key(key): value
+        for key, value in DEFAULT_PRODUCT_ALIASES.items()
+        if _normalize_product_key(key) and _normalize_value(value)
+    }
+    payload = _load_json_file(PRODUCT_ALIAS_FILE)
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = _normalize_product_key(key)
+            normalized_value = _normalize_value(value)
+            if normalized_key and normalized_value:
+                aliases[normalized_key] = str(normalized_value)
+    return aliases
+
+
+def _load_product_catalog_cache() -> dict[str, Any]:
+    payload = _load_json_file(PRODUCT_CACHE_FILE)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_product_catalog_cache(payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(PRODUCT_CACHE_FILE) or ".", exist_ok=True)
+    _write_json_file(PRODUCT_CACHE_FILE, payload)
+
+
+def _get_drive_item_metadata(
+    file_path: str,
+    token: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    headers = _graph_headers(token)
+    proxies = {"http": None, "https": None}
+    last_response: requests.Response | None = None
+    for url in _build_drive_item_urls(file_path):
+        resp = requests.get(
+            url,
+            headers=headers,
+            params={"$select": "id,name,eTag,cTag,lastModifiedDateTime,size,webUrl"},
+            proxies=proxies,
+            timeout=30,
+        )
+        last_response = resp
+        if resp.status_code == 200:
+            return resp.json(), {"success": True, "status_code": resp.status_code}
+
+    status_code = last_response.status_code if last_response is not None else 500
+    detail = last_response.text if last_response is not None else "metadata request failed"
+    error_type, message = _classify_graph_error(status_code, detail, operation="columns")
+    return None, {
+        "success": False,
+        "error_type": error_type,
+        "message": message,
+        "status_code": status_code,
+        "detail": detail,
+    }
+
+
+def _parse_range_rows(address: str | None) -> tuple[int, int] | None:
+    normalized = _normalize_value(address)
+    if normalized is None:
+        return None
+    match = re.search(r"!\$?[A-Z]+\$?(?P<start>\d+)(?::\$?[A-Z]+\$?(?P<end>\d+))?", str(normalized))
+    if not match:
+        return None
+    start_row = int(match.group("start"))
+    end_row = int(match.group("end") or start_row)
+    return start_row, end_row
+
+
+def _get_worksheet_used_range(
+    workbook_base_url: str,
+    sheet_name: str,
+    headers: dict[str, str],
+    proxies: dict[str, str | None],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    worksheet_base = f"{workbook_base_url}/worksheets/{quote(sheet_name, safe='')}"
+    last_response: requests.Response | None = None
+    for suffix in ("usedRange()", "usedRange"):
+        resp = requests.get(f"{worksheet_base}/{suffix}", headers=headers, proxies=proxies, timeout=30)
+        last_response = resp
+        if resp.status_code == 200:
+            return resp.json(), {"success": True, "status_code": resp.status_code}
+
+    status_code = last_response.status_code if last_response is not None else 500
+    detail = last_response.text if last_response is not None else "usedRange request failed"
+    error_type, message = _classify_graph_error(status_code, detail, operation="rows")
+    return None, {
+        "success": False,
+        "error_type": error_type,
+        "message": message,
+        "status_code": status_code,
+        "detail": detail,
+    }
+
+
+def _load_product_catalog_from_onedrive(
+    token: str,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    product_file_path = _normalize_onedrive_path(PRODUCT_FILE_PATH)
+    product_sheet_name = _to_string(PRODUCT_SHEET_NAME)
+    product_column = _to_string(PRODUCT_NAME_COLUMN).upper()
+    category_column = _to_string(PRODUCT_CATEGORY_COLUMN).upper()
+    if (
+        not product_file_path
+        or not product_sheet_name
+        or not re.fullmatch(r"[A-Z]+", product_column)
+        or not re.fullmatch(r"[A-Z]+", category_column)
+    ):
+        return None, {
+            "success": False,
+            "error_type": "invalid_product_catalog_config",
+            "message": "产品库配置无效，请检查 OC_OD_PRODUCT_FILE_PATH、OC_OD_PRODUCT_SHEET_NAME、OC_OD_PRODUCT_NAME_COLUMN 和 OC_OD_PRODUCT_CATEGORY_COLUMN。",
+        }
+
+    headers = _graph_headers(token)
+    proxies = {"http": None, "https": None}
+    workbook_base_url = _build_workbook_base_url(product_file_path)
+    used_range, used_status = _get_worksheet_used_range(workbook_base_url, product_sheet_name, headers, proxies)
+    if not used_range:
+        return None, used_status
+
+    parsed_rows = _parse_range_rows(used_range.get("address"))
+    if parsed_rows is None:
+        return None, {
+            "success": False,
+            "error_type": "invalid_used_range",
+            "message": "无法识别产品明细工作表的 usedRange 地址。",
+            "address": used_range.get("address"),
+        }
+
+    start_row, end_row = parsed_rows
+    if end_row < start_row:
+        end_row = start_row
+    product_col_index = _column_letters_to_index(product_column)
+    category_col_index = _column_letters_to_index(category_column)
+    first_col_index = min(product_col_index, category_col_index)
+    last_col_index = max(product_col_index, category_col_index)
+    first_col = _column_index_to_letter(first_col_index)
+    last_col = _column_index_to_letter(last_col_index)
+    product_offset = product_col_index - first_col_index
+    category_offset = category_col_index - first_col_index
+    range_address = f"{first_col}{start_row}:{last_col}{end_row}"
+    resp_range = requests.get(
+        f"{workbook_base_url}/worksheets/{quote(product_sheet_name, safe='')}/range(address='{range_address}')",
+        headers=headers,
+        proxies=proxies,
+        timeout=30,
+    )
+    if resp_range.status_code != 200:
+        error_type, message = _classify_graph_error(resp_range.status_code, resp_range.text, operation="rows")
+        return None, {
+            "success": False,
+            "error_type": error_type,
+            "message": message,
+            "status_code": resp_range.status_code,
+            "detail": resp_range.text,
+            "range_address": range_address,
+        }
+
+    products: list[str] = []
+    entries: list[dict[str, str | None]] = []
+    category_counts: dict[str, int] = {}
+    seen: set[str] = set()
+    header_names = {"产品名称", "货品名称", "商品名称", "名称", "品名"}
+    for row in resp_range.json().get("values", []):
+        value = _normalize_value(row[product_offset] if len(row) > product_offset else None)
+        if value is None:
+            continue
+        product_name = str(value)
+        if product_name in header_names:
+            continue
+        category = _normalize_entity_name(str(row[category_offset])) if len(row) > category_offset else None
+        product_key = _normalize_product_key(product_name)
+        if not product_key or product_key in seen:
+            continue
+        seen.add(product_key)
+        products.append(product_name)
+        entries.append({"name": product_name, "category": category})
+        category_key = category or "未分类"
+        category_counts[category_key] = category_counts.get(category_key, 0) + 1
+
+    post_read_metadata, _ = _get_drive_item_metadata(product_file_path, token)
+    source_metadata = post_read_metadata or metadata or {}
+    payload = {
+        "file_path": product_file_path,
+        "sheet_name": product_sheet_name,
+        "name_column": product_column,
+        "category_column": category_column,
+        "source_id": source_metadata.get("id"),
+        "source_etag": source_metadata.get("eTag"),
+        "source_ctag": source_metadata.get("cTag"),
+        "source_last_modified": source_metadata.get("lastModifiedDateTime"),
+        "loaded_at": datetime.now().isoformat(timespec="seconds"),
+        "product_count": len(products),
+        "products": products,
+        "entries": entries,
+        "category_counts": category_counts,
+    }
+    _save_product_catalog_cache(payload)
+    return payload, {
+        "success": True,
+        "status": "refreshed",
+        "product_count": len(products),
+        "range_address": range_address,
+    }
+
+
+def _ensure_product_catalog_fresh(
+    token: str | None = None,
+    force_refresh: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    cache = _load_product_catalog_cache()
+    if token is None:
+        token = get_token_automatically()
+    if not token:
+        if cache.get("products"):
+            return cache, {
+                "success": True,
+                "status": "stale_cache",
+                "message": "无法获取 Microsoft Token，已使用本地产品缓存。",
+                "product_count": len(cache.get("products") or []),
+            }
+        return {}, {
+            "success": False,
+            "status": "unavailable",
+            "error_type": "auth_failed",
+            "message": "无法获取 Microsoft Token，且本地产品缓存不存在。",
+        }
+
+    metadata, metadata_status = _get_drive_item_metadata(PRODUCT_FILE_PATH, token)
+    if metadata is None:
+        if cache.get("products"):
+            return cache, {
+                "success": True,
+                "status": "stale_cache",
+                "message": "无法读取 OneDrive 产品库元数据，已使用本地产品缓存。",
+                "metadata_error": metadata_status,
+                "product_count": len(cache.get("products") or []),
+            }
+        return {}, metadata_status
+
+    same_source = (
+        not force_refresh
+        and cache.get("products")
+        and cache.get("source_etag") == metadata.get("eTag")
+        and cache.get("source_last_modified") == metadata.get("lastModifiedDateTime")
+    )
+    if same_source:
+        return cache, {
+            "success": True,
+            "status": "cache_hit",
+            "product_count": len(cache.get("products") or []),
+            "source_etag": metadata.get("eTag"),
+            "source_last_modified": metadata.get("lastModifiedDateTime"),
+        }
+
+    return _load_product_catalog_from_onedrive(token, metadata=metadata)
+
+
+def _product_catalog_entries(catalog: dict[str, Any] | None) -> list[dict[str, str | None]]:
+    if not catalog:
+        return []
+    entries = catalog.get("entries")
+    if isinstance(entries, list):
+        normalized_entries: list[dict[str, str | None]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = _normalize_value(entry.get("name"))
+            if name is None:
+                continue
+            normalized_entries.append(
+                {
+                    "name": str(name),
+                    "category": _normalize_entity_name(entry.get("category")),
+                }
+            )
+        if normalized_entries:
+            return normalized_entries
+
+    return [
+        {"name": str(product), "category": None}
+        for product in (catalog.get("products") or [])
+        if _normalize_value(product) is not None
+    ]
+
+
+def _classify_product_name_pattern(product_name: Any, category: Any = None) -> str:
+    name = _to_string(product_name)
+    family = _category_family(category)
+    if re.match(r"^\d{2,3}-[^-]+-[^-]+", name):
+        if family.endswith("杯") or "ml" in _normalize_product_key(name) or "oz" in _normalize_product_key(name):
+            return "口径-容量/规格-容量/颜色"
+        return "数字规格-属性-属性"
+    if re.match(r"^\d{2,3}.+盖", name):
+        return "口径+盖型"
+    if re.match(r"^\d{3}.+管", name):
+        return "长度+包装/材质+管型"
+    if re.search(r"\d+\*\d+", name):
+        return "克重/材质+尺寸"
+    if "费" in name or "定金" in name or "优惠" in name:
+        return "费用项"
+    return "名称描述型"
+
+
+def _analyze_product_catalog_patterns(catalog: dict[str, Any]) -> list[dict[str, Any]]:
+    entries = _product_catalog_entries(catalog)
+    grouped: dict[str, list[dict[str, str | None]]] = {}
+    for entry in entries:
+        category = entry.get("category") or "未分类"
+        grouped.setdefault(category, []).append(entry)
+
+    summaries: list[dict[str, Any]] = []
+    for category, category_entries in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0])):
+        pattern_counts: dict[str, int] = {}
+        samples_by_pattern: dict[str, list[str]] = {}
+        for entry in category_entries:
+            pattern = _classify_product_name_pattern(entry.get("name"), category)
+            pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+            samples_by_pattern.setdefault(pattern, [])
+            if len(samples_by_pattern[pattern]) < 5:
+                samples_by_pattern[pattern].append(_to_string(entry.get("name")))
+        primary_pattern = max(pattern_counts.items(), key=lambda item: item[1])[0] if pattern_counts else None
+        summaries.append(
+            {
+                "category": category,
+                "family": _category_family(category) or None,
+                "count": len(category_entries),
+                "primary_pattern": primary_pattern,
+                "pattern_counts": pattern_counts,
+                "samples": samples_by_pattern.get(primary_pattern or "", []),
+            }
+        )
+    return summaries
+
+
+def _resolve_product_name_from_catalog(
+    raw_name: Any,
+    catalog: dict[str, Any] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    original_name = _normalize_value(raw_name)
+    if original_name is None:
+        return {
+            "raw_name": None,
+            "resolved_name": None,
+            "matched": False,
+            "needs_review": False,
+            "method": "empty",
+            "confidence": 0,
+        }
+
+    raw_text = str(original_name)
+    raw_key = _normalize_product_key(raw_text)
+    entries = _product_catalog_entries(catalog)
+    products = [entry["name"] for entry in entries if _normalize_value(entry.get("name")) is not None]
+    entry_by_name = {entry["name"]: entry for entry in entries}
+    product_keys = {_normalize_product_key(product): product for product in products}
+    product_key_set = set(product_keys)
+    aliases = aliases or _load_product_aliases()
+
+    def _build_result(
+        resolved_name: str | None,
+        matched: bool,
+        method: str,
+        confidence: float,
+        candidates: list[str] | None = None,
+        needs_review: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "raw_name": raw_text,
+            "resolved_name": resolved_name or raw_text,
+            "matched": matched,
+            "changed": bool(resolved_name and resolved_name != raw_text),
+            "method": method,
+            "confidence": confidence,
+            "candidates": candidates or [],
+            "needs_review": needs_review,
+            "inferred_category": _infer_product_family(raw_text) or None,
+            "matched_category": entry_by_name.get(resolved_name or "", {}).get("category") if resolved_name else None,
+        }
+
+    alias_target = aliases.get(raw_key)
+    if alias_target:
+        alias_target_key = _normalize_product_key(alias_target)
+        if bool(products) and alias_target_key in product_key_set:
+            return _build_result(product_keys[alias_target_key], True, "alias", 1.0)
+        if not products:
+            return _build_result(None, False, "alias_unverified_no_catalog", 0.5, [alias_target], needs_review=True)
+
+    if raw_key in product_keys:
+        return _build_result(product_keys[raw_key], True, "exact", 1.0)
+
+    raw_codes = _product_numeric_codes(raw_text)
+    if raw_codes and products:
+        candidates = sorted(
+            (
+                (_product_match_score(raw_text, entry), entry["name"])
+                for entry in entries
+                if raw_codes.intersection(_product_numeric_codes(entry["name"]))
+                or any(code in _normalize_product_key(entry["name"]) for code in raw_codes)
+            ),
+            reverse=True,
+        )
+        unique_candidates = []
+        seen_candidate_keys: set[str] = set()
+        for _, product in candidates:
+            product_key = _normalize_product_key(product)
+            if product_key in seen_candidate_keys:
+                continue
+            seen_candidate_keys.add(product_key)
+            unique_candidates.append(product)
+        if len(unique_candidates) == 1:
+            return _build_result(unique_candidates[0], True, "numeric_code", 0.92)
+        if len(unique_candidates) > 1:
+            best_score = candidates[0][0]
+            second_score = candidates[1][0] if len(candidates) > 1 else 0
+            if best_score >= 0.86 and best_score - second_score >= 0.06:
+                return _build_result(candidates[0][1], True, "numeric_code_best", best_score)
+            return _build_result(None, False, "ambiguous_numeric_code", best_score, unique_candidates[:5], needs_review=True)
+
+    if products:
+        scored = sorted(
+            (
+                (_product_match_score(raw_text, entry), entry["name"])
+                for entry in entries
+            ),
+            reverse=True,
+        )
+        if scored:
+            best_score, best_product = scored[0]
+            second_score = scored[1][0] if len(scored) > 1 else 0
+            if best_score >= 0.82 and best_score - second_score >= 0.06:
+                return _build_result(best_product, True, "closest_catalog_match", best_score)
+            if best_score >= 0.70:
+                return _build_result(
+                    None,
+                    False,
+                    "ambiguous_catalog_match",
+                    best_score,
+                    [product for _, product in scored[:5]],
+                    needs_review=True,
+                )
+
+    return _build_result(None, False, "not_found", 0, needs_review=bool(products))
 
 
 def _extract_graph_error_code(detail_text: str) -> str | None:
@@ -1223,7 +2099,7 @@ class ExcelOrder(BaseModel):
         self.已收 = _format_money(received_payment)
         self.未收 = _format_money(unpaid)
         self.利润 = _format_money(profit)
-        self.销售单价 = _format_money(_to_float(self.销售单价))
+        self.销售单价 = _format_unit_price(self.销售单价)
         self.成本单价 = _format_money(_to_float(self.成本单价))
         self.成本金额 = _format_money(cost_amount)
         self.运费 = _format_money(shipping_fee)
@@ -1272,6 +2148,104 @@ class OrderIngestRequest(BaseModel):
     )
 
 
+def _standardize_order_products(order: ExcelOrder, token: str | None = None) -> dict[str, Any]:
+    if not _has_item_details(order):
+        return {
+            "enabled": True,
+            "attempted": False,
+            "needs_review": False,
+            "items": [],
+        }
+
+    catalog, catalog_status = _ensure_product_catalog_fresh(token=token)
+    aliases = _load_product_aliases()
+    resolution_items: list[dict[str, Any]] = []
+
+    if order.items:
+        standardized_items: list[OrderItem] = []
+        for item in order.items:
+            if _is_plate_fee_name(item.货品名称):
+                resolution_items.append(
+                    {
+                        "raw_name": item.货品名称,
+                        "resolved_name": "版费",
+                        "matched": True,
+                        "changed": item.货品名称 != "版费",
+                        "method": "fee_item",
+                        "confidence": 1.0,
+                        "candidates": [],
+                        "needs_review": False,
+                        "inferred_category": "费用",
+                        "matched_category": "费用",
+                    }
+                )
+                standardized_items.append(
+                    OrderItem(
+                        货品名称="版费",
+                        数量=item.数量 or "1",
+                        数量单位=item.数量单位 or "项",
+                        销售单价=item.销售单价,
+                        销售金额=item.销售金额,
+                    ).normalized()
+                )
+                continue
+
+            resolved = _resolve_product_name_from_catalog(item.货品名称, catalog=catalog, aliases=aliases)
+            resolution_items.append(resolved)
+            standardized_items.append(
+                OrderItem(
+                    货品名称=_to_string(resolved.get("resolved_name")) or item.货品名称,
+                    数量=item.数量,
+                    数量单位=item.数量单位,
+                    销售单价=item.销售单价,
+                    销售金额=item.销售金额,
+                ).normalized()
+            )
+        order.items = standardized_items
+        order.货品名称 = None
+        order.数量 = None
+        order.数量单位 = None
+        order.销售单价 = None
+    elif _normalize_value(order.货品名称) is not None:
+        if _is_plate_fee_name(order.货品名称):
+            resolved = {
+                "raw_name": order.货品名称,
+                "resolved_name": "版费",
+                "matched": True,
+                "changed": order.货品名称 != "版费",
+                "method": "fee_item",
+                "confidence": 1.0,
+                "candidates": [],
+                "needs_review": False,
+                "inferred_category": "费用",
+                "matched_category": "费用",
+            }
+        else:
+            resolved = _resolve_product_name_from_catalog(order.货品名称, catalog=catalog, aliases=aliases)
+        resolution_items.append(resolved)
+        order.货品名称 = _to_string(resolved.get("resolved_name")) or order.货品名称
+
+    needs_review = any(bool(item.get("needs_review")) for item in resolution_items)
+    if resolution_items and not catalog.get("products"):
+        needs_review = True
+    changed_items = [item for item in resolution_items if item.get("changed") or item.get("needs_review")]
+    if changed_items:
+        order.extra_fields["商品名称标准化"] = json.dumps(changed_items, ensure_ascii=False)
+    if needs_review:
+        order.extra_fields["商品名称需复核"] = "是"
+    else:
+        order.extra_fields.pop("商品名称需复核", None)
+
+    return {
+        "enabled": True,
+        "attempted": True,
+        "needs_review": needs_review,
+        "catalog_status": catalog_status,
+        "product_count": len(catalog.get("products") or []),
+        "items": resolution_items,
+    }
+
+
 def _parse_wechat_order_message_model(
     raw_message: str,
     sender_name: str | None = None,
@@ -1287,7 +2261,10 @@ def _parse_wechat_order_message_model(
     explicit_salesperson = _extract_salesperson_name(raw_message)
     order_date = _normalize_date(order_number, message_time)
     total_amount = _extract_first(r"(?:全款|总货款|合计|共计|共)[:：]?[ \t]*([0-9]+(?:\.[0-9]+)?)\s*元?", raw_message)
-    received_amount = _extract_first(r"(?:已收|实收|收到)[:：]?[ \t]*([0-9]+(?:\.[0-9]+)?)\s*元?", raw_message)
+    received_amount = _extract_first(
+        r"(?:已收定金|已付定金|收定金|定金|已收|实收|收到)[:：]?[ \t]*([0-9]+(?:\.[0-9]+)?)\s*元?",
+        raw_message,
+    )
     payment_note = _extract_first(r"(.+收款)", raw_message)
     item_count = _extract_first(r"(?:商品|货品|产品)总数[:：]\s*(\d+)", raw_message)
 
@@ -1299,10 +2276,14 @@ def _parse_wechat_order_message_model(
     if received_amount is None and re.search(r"全款\s*\d+(?:\.\d+)?\s*元?", raw_message):
         received_amount = total_amount
 
-    customer = _extract_customer_name(raw_message)
-
+    explicit_customer = _extract_first(r"客户[:：]\s*([^\r\n]+)", raw_message)
+    customer = _normalize_replace_target(explicit_customer) if explicit_customer else None
     if customer is None:
-        customer = customer_alias or contact_name
+        customer = customer_alias
+    if customer is None:
+        customer = _extract_customer_name(raw_message)
+    if customer is None:
+        customer = contact_name
 
     order = ExcelOrder(
         日期=order_date,
@@ -1498,6 +2479,14 @@ def health() -> str:
         tenant_id=TENANT_ID,
         file_path=FILE_PATH,
         table_name=TABLE_NAME,
+        product_file_path=_normalize_onedrive_path(PRODUCT_FILE_PATH),
+        product_sheet_name=PRODUCT_SHEET_NAME,
+        product_name_column=PRODUCT_NAME_COLUMN,
+        product_category_column=PRODUCT_CATEGORY_COLUMN,
+        product_cache_file=PRODUCT_CACHE_FILE,
+        product_cache_exists=os.path.exists(PRODUCT_CACHE_FILE),
+        product_alias_file=PRODUCT_ALIAS_FILE,
+        product_alias_file_exists=os.path.exists(PRODUCT_ALIAS_FILE),
         client_id_configured=bool(client_id),
         cache_file=CACHE_FILE,
         cache_exists=cache_exists,
@@ -1709,6 +2698,191 @@ def list_excel_tables(file_path: str | None = None) -> str:
 
 
 @mcp.tool()
+def check_product_catalog_status(check_remote: bool = False) -> str:
+    """
+    检查本地产品库缓存状态。
+
+    默认只读本地缓存，不访问 Microsoft Graph。
+    `check_remote=true` 时会读取 OneDrive 产品库文件元数据，用于判断缓存是否已经过期。
+    """
+    cache = _load_product_catalog_cache()
+    aliases = _load_product_aliases()
+    result_payload: dict[str, Any] = {
+        "success": True,
+        "action": "check_product_catalog_status",
+        "file_path": _normalize_onedrive_path(PRODUCT_FILE_PATH),
+        "sheet_name": PRODUCT_SHEET_NAME,
+        "name_column": PRODUCT_NAME_COLUMN,
+        "category_column": PRODUCT_CATEGORY_COLUMN,
+        "cache_file": PRODUCT_CACHE_FILE,
+        "cache_exists": bool(cache),
+        "product_count": len(cache.get("products") or []),
+        "category_counts": cache.get("category_counts") or {},
+        "alias_file": PRODUCT_ALIAS_FILE,
+        "alias_count": len(aliases),
+        "source_etag": cache.get("source_etag"),
+        "source_last_modified": cache.get("source_last_modified"),
+        "loaded_at": cache.get("loaded_at"),
+    }
+    if check_remote:
+        token = get_token_automatically()
+        if not token:
+            result_payload.update(
+                {
+                    "success": False,
+                    "error_type": "auth_failed",
+                    "message": "无法获取 Microsoft Token，不能检查远端产品库元数据。",
+                }
+            )
+        else:
+            metadata, metadata_status = _get_drive_item_metadata(PRODUCT_FILE_PATH, token)
+            result_payload["remote_check"] = metadata_status
+            if metadata:
+                result_payload.update(
+                    {
+                        "remote_etag": metadata.get("eTag"),
+                        "remote_last_modified": metadata.get("lastModifiedDateTime"),
+                        "remote_changed": (
+                            cache.get("source_etag") != metadata.get("eTag")
+                            or cache.get("source_last_modified") != metadata.get("lastModifiedDateTime")
+                        ),
+                    }
+                )
+
+    _append_tool_log("check_product_catalog_status", result_type="success")
+    return _json_result(**result_payload)
+
+
+@mcp.tool()
+def refresh_product_catalog(include_products: bool = False) -> str:
+    """
+    强制从 OneDrive 产品库刷新本地产品缓存。
+
+    默认只返回产品数量和缓存元数据，不返回产品列表，避免聊天窗口刷屏。
+    """
+    try:
+        token = get_token_automatically()
+    except Exception as exc:
+        result = _json_result(
+            success=False,
+            action="refresh_product_catalog",
+            error_type="auth_failed",
+            message="无法初始化 Microsoft 登录状态，请检查网络或稍后重试。",
+            detail=str(exc),
+        )
+        _append_tool_log("refresh_product_catalog", result_type="auth_failed")
+        return result
+    catalog, status = _ensure_product_catalog_fresh(token=token, force_refresh=True)
+    products = catalog.get("products") or []
+    result_payload = {
+        "success": bool(status.get("success")),
+        "action": "refresh_product_catalog",
+        "message": "产品库缓存已刷新。" if status.get("success") else "产品库缓存刷新失败。",
+        "file_path": _normalize_onedrive_path(PRODUCT_FILE_PATH),
+        "sheet_name": PRODUCT_SHEET_NAME,
+        "name_column": PRODUCT_NAME_COLUMN,
+        "category_column": PRODUCT_CATEGORY_COLUMN,
+        "cache_file": PRODUCT_CACHE_FILE,
+        "product_count": len(products),
+        "category_counts": catalog.get("category_counts") or {},
+        "catalog_status": status,
+        "source_etag": catalog.get("source_etag"),
+        "source_last_modified": catalog.get("source_last_modified"),
+        "loaded_at": catalog.get("loaded_at"),
+    }
+    if include_products:
+        result_payload["products"] = products
+    _append_tool_log("refresh_product_catalog", result_type=status.get("status") or status.get("error_type"))
+    return _json_result(**result_payload)
+
+
+@mcp.tool()
+def analyze_product_catalog_patterns(force_refresh: bool = False, include_samples: bool = True) -> str:
+    """
+    按 C 列分类分析产品明细 B 列命名规律。
+
+    用于排查商品语义匹配规则，不写入订单 Excel。
+    """
+    try:
+        token = get_token_automatically()
+    except Exception as exc:
+        result = _json_result(
+            success=False,
+            action="analyze_product_catalog_patterns",
+            error_type="auth_failed",
+            message="无法初始化 Microsoft 登录状态，请检查网络或稍后重试。",
+            detail=str(exc),
+        )
+        _append_tool_log("analyze_product_catalog_patterns", result_type="auth_failed")
+        return result
+
+    catalog, status = _ensure_product_catalog_fresh(token=token, force_refresh=force_refresh)
+    summaries = _analyze_product_catalog_patterns(catalog)
+    if not include_samples:
+        summaries = [
+            {key: value for key, value in item.items() if key != "samples"}
+            for item in summaries
+        ]
+    result = _json_result(
+        success=bool(status.get("success")),
+        action="analyze_product_catalog_patterns",
+        message="已按产品分类分析 B 列命名规律。" if status.get("success") else "产品库不可用，无法分析命名规律。",
+        file_path=_normalize_onedrive_path(PRODUCT_FILE_PATH),
+        sheet_name=PRODUCT_SHEET_NAME,
+        name_column=PRODUCT_NAME_COLUMN,
+        category_column=PRODUCT_CATEGORY_COLUMN,
+        product_count=len(catalog.get("products") or []),
+        category_count=len(summaries),
+        catalog_status=status,
+        patterns=summaries,
+    )
+    _append_tool_log("analyze_product_catalog_patterns", result_type=status.get("status") or status.get("error_type"))
+    return result
+
+
+@mcp.tool()
+def resolve_product_name(raw_name: str, force_refresh: bool = False) -> str:
+    """
+    将业务员发送的原始商品名解析为产品明细表中的标准产品名称。
+
+    用于单独测试商品名标准化，不写入订单 Excel。
+    """
+    try:
+        token = get_token_automatically()
+    except Exception as exc:
+        result = _json_result(
+            success=False,
+            action="resolve_product_name",
+            error_type="auth_failed",
+            message="无法初始化 Microsoft 登录状态，请检查网络或稍后重试。",
+            detail=str(exc),
+        )
+        _append_tool_log("resolve_product_name", result_type="auth_failed")
+        return result
+
+    catalog, status = _ensure_product_catalog_fresh(token=token, force_refresh=force_refresh)
+    resolved = _resolve_product_name_from_catalog(raw_name, catalog=catalog, aliases=_load_product_aliases())
+    result = _json_result(
+        success=True,
+        action="resolve_product_name",
+        raw_name=raw_name,
+        resolved_name=resolved.get("resolved_name"),
+        matched=resolved.get("matched"),
+        changed=resolved.get("changed"),
+        method=resolved.get("method"),
+        confidence=resolved.get("confidence"),
+        inferred_category=resolved.get("inferred_category"),
+        matched_category=resolved.get("matched_category"),
+        candidates=resolved.get("candidates"),
+        needs_review=resolved.get("needs_review"),
+        catalog_status=status,
+        product_count=len(catalog.get("products") or []),
+    )
+    _append_tool_log("resolve_product_name", result_type=resolved.get("method"))
+    return result
+
+
+@mcp.tool()
 def parse_wechat_order_message(
     raw_message: str,
     sender_name: str | None = None,
@@ -1811,15 +2985,26 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
 
     existing_order = request.existing_order
     draft_row_indexes: list[int] = []
+    historical_row_indexes: list[int] = []
     if existing_order is None:
-        recent_draft = _find_recent_draft(parsed.order, request.sender_name)
+        prefer_pending_replace = (
+            _to_string(parsed.order.extra_fields.get("消息意图")) == "replace_order"
+            and not _has_item_details(parsed.order)
+        )
+        recent_draft = _find_recent_draft(
+            parsed.order,
+            request.sender_name,
+            prefer_pending_replace=prefer_pending_replace,
+        )
         if recent_draft:
             try:
                 existing_order = ExcelOrder.model_validate(recent_draft.get("order") or {})
                 draft_row_indexes = _normalize_row_indexes(recent_draft.get("row_indexes"))
+                historical_row_indexes = _normalize_row_indexes(recent_draft.get("historical_row_indexes"))
             except Exception:
                 existing_order = None
                 draft_row_indexes = []
+                historical_row_indexes = []
 
     if existing_order is not None:
         final_order = _merge_orders(
@@ -1829,6 +3014,8 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
         )
         if draft_row_indexes:
             final_order.extra_fields["最近草稿行索引"] = json.dumps(draft_row_indexes, ensure_ascii=False)
+        if historical_row_indexes:
+            final_order.extra_fields["历史订单行索引"] = json.dumps(historical_row_indexes, ensure_ascii=False)
         pipeline_action = "merged_then_processed"
         duplicate_order_number = bool(
             _normalize_value(existing_order.单号)
@@ -1859,7 +3046,22 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
         cached_row_indexes = _normalize_row_indexes(process_payload.get("row_indexes"))
         if not cached_row_indexes:
             cached_row_indexes = _normalize_row_indexes(process_payload.get("replaced_row_indexes"))
-        _store_recent_draft(final_order, request.sender_name, cached_row_indexes)
+        historical_indexes = _normalize_row_indexes(process_payload.get("historical_row_indexes"))
+        if not historical_indexes:
+            historical_indexes = _normalize_row_indexes(process_payload.get("row_indexes"))
+        pending_replace = (
+            process_payload.get("action") == "needs_review"
+            and process_payload.get("error_type") == "row_count_mismatch"
+            and _has_item_details(final_order)
+        )
+        _store_recent_draft(
+            final_order,
+            request.sender_name,
+            cached_row_indexes,
+            historical_row_indexes=historical_indexes,
+            pending_replace=pending_replace,
+            matched_by=_to_string(process_payload.get("matched_by")),
+        )
     effective_order_payload = process_payload.get("effective_order") or final_order.to_excel_dict()
     required_fields = ("单号", "销售员", "客户", "货品名称", "数量", "销售金额", "收货人电话", "收货地址")
     missing_fields = [
@@ -1871,6 +3073,13 @@ def ingest_order_message(request: OrderIngestRequest) -> str:
     if process_payload.get("success") and process_payload.get("action") in {"updated", "replaced"} and not _has_item_details(final_order):
         missing_fields = [field_name for field_name in missing_fields if field_name not in {"货品名称", "数量", "销售金额"}]
         needs_review = bool(missing_fields)
+    product_needs_review = bool(process_payload.get("product_needs_review")) or (
+        _to_string(final_order.extra_fields.get("商品名称需复核")) == "是"
+    )
+    if product_needs_review:
+        needs_review = True
+        if "货品名称标准化" not in missing_fields:
+            missing_fields.append("货品名称标准化")
     result = _json_result(
         success=True,
         action=pipeline_action,
@@ -1910,9 +3119,6 @@ def process_excel_order(
     - 默认不自动建列，避免误加表头
     - `dry_run=true` 时只做读取和匹配，不真正写入 Excel
     """
-    row_dicts = _build_excel_row_dicts(order)
-    order_data = row_dicts[0]
-    detail_row_count = len(row_dicts)
     has_item_details = _has_item_details(order)
     message_intent = _to_string(order.extra_fields.get("消息意图")) or ("revise_items" if has_item_details else "supplement")
     replace_existing_block = message_intent == "replace_order"
@@ -1946,6 +3152,11 @@ def process_excel_order(
         "Content-Type": "application/json",
     }
     proxies = {"http": None, "https": None}
+    product_resolution = _standardize_order_products(order, token=token)
+    row_dicts = _build_excel_row_dicts(order)
+    order_data = row_dicts[0]
+    detail_row_count = len(row_dicts)
+    has_item_details = _has_item_details(order)
 
     try:
         resp_cols = requests.get(f"{base_url}/columns", headers=headers, proxies=proxies, timeout=30)
@@ -2077,7 +3288,18 @@ def process_excel_order(
             return -1, [], None, []
 
         target_salesperson = _to_string(order_data.get("销售员"))
-        preferred_row_hint = order.extra_fields.get("最近草稿行索引")
+        preferred_row_hint = None
+        historical_row_hint = order.extra_fields.get("历史订单行索引")
+        if isinstance(historical_row_hint, str):
+            try:
+                historical_row_hint = json.loads(historical_row_hint)
+            except Exception:
+                historical_row_hint = None
+        historical_row_indexes = _normalize_row_indexes(historical_row_hint)
+        if replace_existing_block and historical_row_indexes:
+            preferred_row_hint = historical_row_indexes
+        else:
+            preferred_row_hint = order.extra_fields.get("最近草稿行索引")
         if isinstance(preferred_row_hint, str):
             try:
                 preferred_row_hint = json.loads(preferred_row_hint)
@@ -2099,7 +3321,7 @@ def process_excel_order(
                 matched_row_indexes = expanded_indexes or valid_indexes
                 found_row_index = matched_row_indexes[-1]
                 existing_row_values = rows_data[found_row_index].get("values", [[]])[0]
-                matched_by = "最近草稿"
+                matched_by = "历史订单锚点" if replace_existing_block and historical_row_indexes else "最近草稿"
 
         if found_row_index == -1:
             found_row_index, existing_row_values, matched_by, matched_row_indexes = _find_matching_row(
@@ -2145,7 +3367,10 @@ def process_excel_order(
                 matched_value=target_order_id or target_customer,
                 row_index=found_row_index if found_row_index != -1 else None,
                 row_indexes=matched_row_indexes or None,
+                historical_row_indexes=historical_row_indexes or None,
                 detail_row_count=detail_row_count,
+                product_resolution=product_resolution,
+                product_needs_review=product_resolution.get("needs_review"),
                 order=order_data,
                 orders=row_dicts,
                 effective_order=order_data,
@@ -2244,13 +3469,15 @@ def process_excel_order(
                     row_index=found_row_index,
                     row_indexes=matched_row_indexes,
                     detail_row_count=len(matched_row_indexes),
+                    product_resolution=product_resolution,
+                    product_needs_review=product_resolution.get("needs_review"),
                     added_columns=added_columns,
                     skipped_columns=skipped_columns,
                     order=order_data,
                     orders=row_dicts,
                     effective_order=order_data,
                 )
-                format_ok, format_warning = _format_payment_block(
+                format_ok, format_warning = _format_order_rows(
                     base_url=base_url,
                     headers=headers,
                     proxies=proxies,
@@ -2302,7 +3529,10 @@ def process_excel_order(
                         row_index=found_row_index,
                         row_indexes=created_row_indexes,
                         replaced_row_indexes=matched_row_indexes,
+                        historical_row_indexes=historical_row_indexes or matched_row_indexes,
                         detail_row_count=detail_row_count,
+                        product_resolution=product_resolution,
+                        product_needs_review=product_resolution.get("needs_review"),
                         added_columns=added_columns,
                         skipped_columns=skipped_columns,
                         order=order_data,
@@ -2310,7 +3540,7 @@ def process_excel_order(
                         effective_order=order_data,
                         message_intent=message_intent,
                     )
-                    format_ok, format_warning = _format_payment_block(
+                    format_ok, format_warning = _format_order_rows(
                         base_url=base_url,
                         headers=headers,
                         proxies=proxies,
@@ -2322,7 +3552,16 @@ def process_excel_order(
                             **json.loads(result),
                             format_warning=format_warning,
                         )
-                    _append_tool_log("process_excel_order", order_number=order.单号, result_type="replaced")
+                    _append_tool_log(
+                        "process_excel_order",
+                        order_number=order.单号,
+                        result_type="replaced",
+                        matched_by=matched_by,
+                        row_indexes=created_row_indexes,
+                        replaced_row_indexes=matched_row_indexes,
+                        historical_row_indexes=historical_row_indexes or matched_row_indexes,
+                        message_intent=message_intent,
+                    )
                     return result
 
                 error_type, error_message = _classify_graph_error(
@@ -2355,10 +3594,21 @@ def process_excel_order(
                     matched_value=target_order_id or target_customer,
                     row_index=found_row_index,
                     row_indexes=matched_row_indexes,
+                    historical_row_indexes=historical_row_indexes or matched_row_indexes,
                     detail_row_count=detail_row_count,
+                    product_resolution=product_resolution,
+                    product_needs_review=product_resolution.get("needs_review"),
                     needs_review=True,
                 )
-                _append_tool_log("process_excel_order", order_number=order.单号, result_type="needs_review")
+                _append_tool_log(
+                    "process_excel_order",
+                    order_number=order.单号,
+                    result_type="needs_review",
+                    matched_by=matched_by,
+                    row_indexes=matched_row_indexes,
+                    historical_row_indexes=historical_row_indexes or matched_row_indexes,
+                    message_intent=message_intent,
+                )
                 return result
 
             for row_offset, row_index in enumerate(matched_row_indexes):
@@ -2408,13 +3658,15 @@ def process_excel_order(
                 row_index=found_row_index,
                 row_indexes=matched_row_indexes,
                 detail_row_count=detail_row_count,
+                product_resolution=product_resolution,
+                product_needs_review=product_resolution.get("needs_review"),
                 added_columns=added_columns,
                 skipped_columns=skipped_columns,
                 order=order_data,
                 orders=row_dicts,
                 effective_order=order_data,
             )
-            format_ok, format_warning = _format_payment_block(
+            format_ok, format_warning = _format_order_rows(
                 base_url=base_url,
                 headers=headers,
                 proxies=proxies,
@@ -2447,13 +3699,15 @@ def process_excel_order(
                 matched_value=None,
                 row_index=None,
                 detail_row_count=detail_row_count,
+                product_resolution=product_resolution,
+                product_needs_review=product_resolution.get("needs_review"),
                 added_columns=added_columns,
                 skipped_columns=skipped_columns,
                 order=order_data,
                 orders=row_dicts,
                 effective_order=order_data,
             )
-            format_ok, format_warning = _format_payment_block(
+            format_ok, format_warning = _format_order_rows(
                 base_url=base_url,
                 headers=headers,
                 proxies=proxies,

@@ -73,6 +73,33 @@ Examples / 示例：
 - `4色` -> `数量=4`，`数量单位=色`
 - `1件(1000个)` -> `数量=1`，`数量单位=件`
 
+## Product Name Standardization / 商品名称标准化
+
+- OpenClaw should pass the product name extracted from text or images as-is.
+- The MCP server standardizes product names before writing Excel.
+- Product names and categories are loaded from `OC_OD_PRODUCT_FILE_PATH` / `OC_OD_PRODUCT_SHEET_NAME` / `OC_OD_PRODUCT_NAME_COLUMN` / `OC_OD_PRODUCT_CATEGORY_COLUMN`.
+- On every order write, the server first checks the OneDrive product workbook metadata. If `eTag` and `lastModifiedDateTime` are unchanged, the local cache is used. If the file changed or the cache is missing, the product list is refreshed from the product sheet.
+- `product_aliases.json` can map common salesperson variants to the canonical product name.
+- Matching is not limited to the alias examples. The server first uses the category column to infer naming families such as cup, lid, straw, bag, and fee, then compares the raw product name against the product names in the configured product column and chooses a safe closest match only when confidence and uniqueness are sufficient.
+
+- OpenClaw 只需要把图片或文字中提取到的原始商品名传给 MCP。
+- MCP 服务会在写入 Excel 前统一做商品名称标准化。
+- 产品名称和分类来源由 `OC_OD_PRODUCT_FILE_PATH` / `OC_OD_PRODUCT_SHEET_NAME` / `OC_OD_PRODUCT_NAME_COLUMN` / `OC_OD_PRODUCT_CATEGORY_COLUMN` 配置。
+- 每次写订单前，服务会先检查 OneDrive 产品库文件元数据；如果 `eTag` 和 `lastModifiedDateTime` 没变，就使用本地缓存；如果文件变更或缓存不存在，则重新读取产品明细表。
+- 可通过 `product_aliases.json` 把业务员常用简写映射到标准产品名。
+- 匹配不限于示例别名。服务会先使用分类列推断杯、盖、吸管、袋、费用等命名族，再把原始商品名与配置列中的产品名称逐个比较，只有在置信度和唯一性足够时才自动采用最接近的标准名称。
+
+Example aliases / 别名示例：
+
+```json
+{
+  "98-400": "98400-14oz-400ml",
+  "98-400pet": "98400-14oz-400ml",
+  "定制98-400杯": "98400-14oz-400ml",
+  "98-400ml": "98400-14oz-400ml"
+}
+```
+
 ## Example JSON / JSON 示例
 
 ```json

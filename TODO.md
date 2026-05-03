@@ -21,6 +21,12 @@ This file tracks the next recommended improvements for `chat-order-excel-mcp`.
 - Improve latest-block replacement rules so when a salesperson sends a new image/text and explicitly says “以这个为准”, the latest matching order block can be safely superseded.
 - 增强最新订单块替换规则：当业务员发送新图片/新文本并明确说“以这个为准”时，可以安全地用最新订单块覆盖旧块语义。
 
+- Add a long-term order-change mode that prefers Excel history matching over recent draft cache when a salesperson sends a quoted follow-up such as “客户名以这个为准”, especially when the order may be revised days later and the order number is missing.
+- 增加“长周期改单模式”：当业务员引用前面的图片或文本并发送“客户名以这个为准”这类说明时，即使已过多日、且单号缺失，也优先依赖 Excel 历史订单块匹配，而不是只依赖最近草稿缓存。
+
+- In long-term change mode, use `销售员 + 客户 + 匹配客户别名` as the primary replacement key and treat recent-draft cache only as a short-term accelerator.
+- 在长周期改单模式里，以 `销售员 + 客户 + 匹配客户别名` 作为主要替换锚点，最近草稿缓存只作为短期加速器，不再作为唯一依据。
+
 - Add automated regression tests for OCR parsing, multi-line updates, duplicate matching, and supplement-only updates.
 - 增加自动化回归测试，覆盖 OCR 解析、多行更新、重复单匹配和补充消息更新。
 
@@ -34,6 +40,9 @@ This file tracks the next recommended improvements for `chat-order-excel-mcp`.
 
 - Add an explicit “update only the latest draft block” option for OpenClaw workflows.
 - 增加“只更新最近草稿块”的显式参数，方便 OpenClaw 精确控制更新行为。
+
+- Add a configurable long-term replacement window and audit trail so delayed order changes can record which historical block was replaced and why.
+- 增加可配置的长周期替换窗口和审计记录，让延迟改单时能记录替换了哪一块历史订单、依据是什么。
 
 - Add structured payment metadata so notes such as “微信收款 / 支付宝收款 / 张三收款” can be separated from general remarks.
 - 增加结构化收款信息，把“微信收款 / 支付宝收款 / 张三收款”等从普通备注里拆出来。

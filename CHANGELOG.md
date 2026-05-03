@@ -13,6 +13,12 @@ All notable changes to this project will be documented in this file.
 - 新增本地“最近草稿缓存”，用于处理图片和补充文字分开发送的场景，让后续补充消息在匹配 Excel 之前先复用最近草稿
 - Added `.gitignore` coverage for the runtime draft cache file `order_draft_cache.json`
 - 为运行期草稿缓存文件 `order_draft_cache.json` 补充了 `.gitignore` 忽略规则
+- Added OneDrive-backed product catalog caching and product name resolution tools
+- 新增基于 OneDrive 产品明细表的产品库缓存和商品名称解析工具
+- Added product catalog pattern analysis by category
+- 新增按产品分类分析产品命名规律的工具
+- Added a product alias example file for mapping salesperson shorthand names to canonical product names
+- 新增商品别名示例文件，用于把业务员常用简写映射到标准商品名称
 
 ### Changed / 变更
 
@@ -32,6 +38,26 @@ All notable changes to this project will be documented in this file.
 - `客户名以这个为准` 这类确认替换消息现在会正确提取客户名、缓存待替换草稿，并在真正替换前把缓存行索引扩展回完整历史订单块
 - Replace-order deletion now uses working Graph row deletion paths, allowing old multi-line blocks to be removed before rebuilding the latest single-line or revised order
 - 替换订单时现在改用可用的 Graph 行删除路径，能够先删除旧的多行订单块，再重建最新的一行或修订版订单
+- Sales unit prices now preserve OCR/text decimal precision instead of being rounded as money totals
+- 销售单价现在保留图片或文本中的原始小数精度，不再按金额汇总字段四舍五入
+- Deposit phrases and region/address labels are now recognized as received payments and shipping addresses during split image/text order entry
+- 图文分开发送时，现在可识别定金类表述为已收款，并把地区类字段作为收货地址处理
+- Excel write formatting now applies a flexible number format to sales unit price cells after row creation or update
+- Excel 写入后现在会给销售单价单元格设置灵活数字格式，避免小数显示被固定为两位
+- Order writes now check the product workbook metadata first and refresh local product cache only when the OneDrive file changed or the cache is missing
+- 订单写入前现在会先检查产品库文件元数据，仅在 OneDrive 文件变化或缓存缺失时刷新本地产品缓存
+- Product names are now standardized before Excel writing by comparing raw salesperson names with the configured OneDrive product-name column, with aliases only used as a verified override
+- 商品名称现在会在写入 Excel 前与 OneDrive 产品名称列逐个比较，别名表只作为可校验的辅助覆盖规则
+- Product matching now loads the category column with the product-name column and uses category-aware naming rules before closest-name matching
+- 商品匹配现在会同时读取分类列和产品名称列，并先按分类命名规律做语义加权，再执行最接近产品名匹配
+- Customer and order-number parsing now trims trailing punctuation, so image OCR text like `客户：示例客户,` and follow-up text like `单号：260424-01（示例客户）` resolve to the same customer key
+- 客户名和单号解析现在会清理尾随标点，图片 OCR 中的 `客户：示例客户,` 与后续文本 `单号：260424-01（示例客户）` 会解析为同一个客户锚点
+- Follow-up messages with order-number aliases now treat the alias as the customer before considering receiver or address fields
+- 带括号客户名的补充消息现在优先把括号内容作为客户名，不会被收件人或地址字段覆盖
+- Receiver names and phone numbers are now split from the same line, and phone/contact lines are excluded from product-item parsing
+- 收货联系人和手机号现在支持同一行自动拆分，并且手机号/联系人行不会再被误识别成商品明细
+- Plate fees are now parsed as standalone fee line items with quantity `1`, unit `项`, and the detected price as both unit price and line amount
+- 文本或图片 OCR 中出现 `版费` 时，现在会作为独立费用明细行写入，数量为 `1`、单位为 `项`，并保留识别到的价格
 
 ## [0.1.2] - 2026-03-30
 

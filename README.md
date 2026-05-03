@@ -70,6 +70,7 @@ Do not commit real customer names, phone numbers, addresses, order screenshots, 
 - Parse order text from chat messages
 - Merge follow-up text into an existing draft order
 - Match recent orders by salesperson and customer from bottom to top
+- Standardize product names against a OneDrive product catalog with local caching
 - Write or update OneDrive Excel rows through Microsoft Graph
 - Expose tools over Streamable HTTP for OpenClaw
 
@@ -79,6 +80,10 @@ Do not commit real customer names, phone numbers, addresses, order screenshots, 
 - `parse_wechat_order_message`
 - `merge_order_update`
 - `process_excel_order`
+- `check_product_catalog_status`
+- `refresh_product_catalog`
+- `resolve_product_name`
+- `analyze_product_catalog_patterns`
 
 ## Requirements
 
@@ -103,6 +108,12 @@ OC_OD_CLIENT_ID=your_microsoft_app_client_id
 OC_OD_FILE_PATH=YourFolder/订单汇总.xlsx
 OC_OD_TABLE_NAME=表1
 OC_OD_CACHE_FILE=onedrive_token_cache.bin
+OC_OD_PRODUCT_FILE_PATH=众一/2026诚亿报表.xlsx
+OC_OD_PRODUCT_SHEET_NAME=产品明细
+OC_OD_PRODUCT_NAME_COLUMN=B
+OC_OD_PRODUCT_CATEGORY_COLUMN=C
+CY_PRODUCT_CACHE_FILE=product_catalog_cache.json
+CY_PRODUCT_ALIAS_FILE=product_aliases.json
 
 CY_EXCEL_MCP_HOST=127.0.0.1
 CY_EXCEL_MCP_PORT=18061
@@ -194,6 +205,8 @@ OpenClaw integration notes are available in `docs/OPENCLAW_INTEGRATION.md`.
 - Personal OneDrive has been validated with `OC_OD_TENANT_ID=consumers`.
 - `OC_OD_FILE_PATH` can include a nested folder path such as `YourFolder/订单汇总.xlsx`.
 - `OC_OD_TABLE_NAME` must be the Excel table object name, not the worksheet name.
+- Product name standardization reads the product-name column and category column from `OC_OD_PRODUCT_SHEET_NAME` in `OC_OD_PRODUCT_FILE_PATH`.
+- Before each order write, the server checks product workbook metadata and uses `product_catalog_cache.json` when the file has not changed.
 - The first Microsoft login may require device-flow authorization in the terminal.
 - After the first successful sign-in, the token is cached in `onedrive_token_cache.bin` and reused on later runs.
 - Empty values do not overwrite existing Excel values.

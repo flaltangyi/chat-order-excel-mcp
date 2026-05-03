@@ -70,6 +70,7 @@ OpenClaw 接入文档：[docs/OPENCLAW_INTEGRATION.zh-CN.md](docs/OPENCLAW_INTEG
 - 解析微信群里的订单文字
 - 将后续补充文字合并到已有草稿订单
 - 按业务员和客户信息从 Excel 底部倒序匹配最近订单
+- 根据 OneDrive 产品库和本地缓存标准化商品名称
 - 通过 Microsoft Graph 新增或更新 Excel 行
 - 通过 Streamable HTTP 暴露给 OpenClaw 使用
 
@@ -79,6 +80,10 @@ OpenClaw 接入文档：[docs/OPENCLAW_INTEGRATION.zh-CN.md](docs/OPENCLAW_INTEG
 - `parse_wechat_order_message`
 - `merge_order_update`
 - `process_excel_order`
+- `check_product_catalog_status`
+- `refresh_product_catalog`
+- `resolve_product_name`
+- `analyze_product_catalog_patterns`
 
 ## 环境要求
 
@@ -103,6 +108,12 @@ OC_OD_CLIENT_ID=你的微软应用client_id
 OC_OD_FILE_PATH=你的文件夹/订单汇总.xlsx
 OC_OD_TABLE_NAME=表1
 OC_OD_CACHE_FILE=onedrive_token_cache.bin
+OC_OD_PRODUCT_FILE_PATH=众一/2026诚亿报表.xlsx
+OC_OD_PRODUCT_SHEET_NAME=产品明细
+OC_OD_PRODUCT_NAME_COLUMN=B
+OC_OD_PRODUCT_CATEGORY_COLUMN=C
+CY_PRODUCT_CACHE_FILE=product_catalog_cache.json
+CY_PRODUCT_ALIAS_FILE=product_aliases.json
 
 CY_EXCEL_MCP_HOST=127.0.0.1
 CY_EXCEL_MCP_PORT=18061
@@ -194,6 +205,8 @@ OpenClaw 接入说明见：`docs/OPENCLAW_INTEGRATION.zh-CN.md`
 - 个人 OneDrive 已验证可用，建议 `OC_OD_TENANT_ID=consumers`
 - `OC_OD_FILE_PATH` 可以填写带文件夹的相对路径，例如 `你的文件夹/订单汇总.xlsx`
 - `OC_OD_TABLE_NAME` 必须是 Excel 里的表格对象名，不是工作表名称
+- 商品名称标准化默认读取 `OC_OD_PRODUCT_FILE_PATH` 中 `OC_OD_PRODUCT_SHEET_NAME` 工作表的产品名称列和分类列
+- 每次录单前会先检查产品库文件元数据，文件未变化时使用本地 `product_catalog_cache.json` 缓存
 - 首次连接微软账号时，终端里可能会出现 device flow 登录提示
 - 首次登录成功后，token 会缓存到 `onedrive_token_cache.bin`，后续运行会优先复用
 - 空值不会覆盖 Excel 里已有值
