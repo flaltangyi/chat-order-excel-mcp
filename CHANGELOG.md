@@ -58,6 +58,10 @@ All notable changes to this project will be documented in this file.
 - 收货联系人和手机号现在支持同一行自动拆分，并且手机号/联系人行不会再被误识别成商品明细
 - Plate fees are now parsed as standalone fee line items with quantity `1`, unit `项`, and the detected price as both unit price and line amount
 - 文本或图片 OCR 中出现 `版费` 时，现在会作为独立费用明细行写入，数量为 `1`、单位为 `项`，并保留识别到的价格
+- Payment notes ending with `收款` now mark the parsed total amount as received when no explicit received amount is present
+- 当消息包含 `总货款` 且后续出现 `收款` 说明时，如未单独写明已收金额，现在会自动把总货款记为已收
+- Address lines without a colon, such as `地址...`, now strip the address label before writing to Excel
+- 无冒号的地址行（例如 `地址...`）现在会在写入前去掉地址标签
 
 ## [0.1.2] - 2026-03-30
 

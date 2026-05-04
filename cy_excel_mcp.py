@@ -573,16 +573,27 @@ def _looks_like_address(line: str) -> bool:
 
 
 def _extract_address(text: str) -> str | None:
-    explicit = _extract_first(r"(?:收货地址|地址|所在地区|地区|所在地址)[:：]\s*(.+)", text)
+    def _clean_address_label(value: str | None) -> str | None:
+        normalized = _normalize_value(value)
+        if normalized is None:
+            return None
+        cleaned = re.sub(
+            r"^(?:收货地址|详细地址|所在地区|所在地址|地址|地区)[:：]?\s*",
+            "",
+            str(normalized).strip(),
+        )
+        return _normalize_value(cleaned)
+
+    explicit = _extract_first(r"(?:收货地址|详细地址|地址|所在地区|地区|所在地址)[:：]?\s*([^\r\n]+)", text)
     if explicit:
-        return explicit
+        return _clean_address_label(explicit)
 
     candidate_lines = [_normalize_ocr_line(line) for line in text.splitlines() if line.strip()]
     address_candidates = [line for line in candidate_lines if _looks_like_address(line)]
     if not address_candidates:
         return None
     address_candidates.sort(key=len, reverse=True)
-    return _normalize_value(address_candidates[0])
+    return _clean_address_label(address_candidates[0])
 
 
 def _split_quantity_and_unit(raw: str | None) -> tuple[str | None, str | None]:
@@ -2274,6 +2285,14 @@ def _parse_wechat_order_message_model(
     if total_amount is None:
         total_amount = _normalize_value(aggregated_items.get("销售金额"))
     if received_amount is None and re.search(r"全款\s*\d+(?:\.\d+)?\s*元?", raw_message):
+        received_amount = total_amount
+    if (
+        received_amount is None
+        and total_amount is not None
+        and payment_note
+        and "收款" in payment_note
+        and not re.search(r"(未收|没收|未付款|未付|未结|欠款)", payment_note)
+    ):
         received_amount = total_amount
 
     explicit_customer = _extract_first(r"客户[:：]\s*([^\r\n]+)", raw_message)
